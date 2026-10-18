@@ -25,6 +25,12 @@ import {
   Lock,
   Unlock,
   Loader2,
+  Calculator,
+  Clock,
+  Calendar,
+  Users,
+  RefreshCw,
+  Phone,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db } from './firebase';
@@ -35,6 +41,8 @@ import {
   deleteDoc,
   updateDoc,
   doc,
+  setDoc,
+  onSnapshot,
 } from 'firebase/firestore';
 
 export interface Project {
@@ -48,16 +56,102 @@ export interface Project {
   createdAt?: string;
 }
 
+export interface SiteConfig {
+  siteName: string;
+  facebookUrl: string;
+  instagramUrl: string;
+  phoneNumber: string;
+}
+
+const DEFAULT_SITE_CONFIG: SiteConfig = {
+  siteName: 'منصه مشروعات المطور Amir Lamay',
+  facebookUrl: 'https://www.facebook.com/',
+  instagramUrl: 'https://www.instagram.com/',
+  phoneNumber: '201000000000',
+};
+
+const SITE_CONFIG_STORAGE_KEY = 'glassfolio_site_config_v1';
+
 export default function App() {
   // 1. تعريف حالة المشاريع
   const [projects, setProjects] = useState<Project[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
+  // Navigation View State ('projects' | 'age')
+  const [activeView, setActiveView] = useState<'projects' | 'age'>('projects');
+
+  // Site Config State (Website Name + Contact Links) — updates in real-time
+  const [siteConfig, setSiteConfig] = useState<SiteConfig>(() => {
+    try {
+      const saved = localStorage.getItem(SITE_CONFIG_STORAGE_KEY);
+      if (saved) {
+        return { ...DEFAULT_SITE_CONFIG, ...JSON.parse(saved) };
+      }
+    } catch {
+      // ignore
+    }
+    return DEFAULT_SITE_CONFIG;
+  });
+
+  // Sync Site Title with Browser Tab in real-time
+  useEffect(() => {
+    document.title = siteConfig.siteName || 'منصه مشروعات المطور Amir Lamay';
+    try {
+      localStorage.setItem(SITE_CONFIG_STORAGE_KEY, JSON.stringify(siteConfig));
+    } catch {
+      // ignore
+    }
+  }, [siteConfig]);
+
+  // Real-time Firestore listener for Site Config
+  useEffect(() => {
+    const configDocRef = doc(db, 'settings', 'siteConfig');
+    const unsubscribe = onSnapshot(
+      configDocRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data() as Partial<SiteConfig>;
+          setSiteConfig((prev) => ({
+            siteName: data.siteName ?? prev.siteName,
+            facebookUrl: data.facebookUrl ?? prev.facebookUrl,
+            instagramUrl: data.instagramUrl ?? prev.instagramUrl,
+            phoneNumber: data.phoneNumber ?? prev.phoneNumber,
+          }));
+        }
+      },
+      () => {
+        // Ignore if offline or rules restrict settings collection
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Update Site Config helper (updates state immediately + saves to Firestore)
+  const handleUpdateSiteConfig = (field: keyof SiteConfig, value: string) => {
+    setSiteConfig((prev) => {
+      const updated = { ...prev, [field]: value };
+      setDoc(doc(db, 'settings', 'siteConfig'), updated, { merge: true }).catch(() => {
+        // Fallback already saved in localStorage
+      });
+      return updated;
+    });
+  };
+
+  // Live Clock State (Top-Left: Day, Date, 12-hour Clock)
+  const [currentTime, setCurrentTime] = useState<Date>(() => new Date());
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Mobile Sidebar Drawer State
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
-  // Authentication / Settings State (Default: false so visitors only see description + open button)
+  // Authentication / Settings State (Default: false)
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
@@ -68,7 +162,7 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [isEditingInModal, setIsEditingInModal] = useState(false);
 
-  // Search State
+  // Live Search State
   const [searchQuery, setSearchQuery] = useState('');
 
   // Add Project Form State
@@ -91,6 +185,144 @@ export default function App() {
   // Clipboard & Toast Notification State
   const [copiedFieldKey, setCopiedFieldKey] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // =====================================================================
+  // AGE CALCULATOR & OFFICIAL LIVE EGYPT POPULATION STATES
+  // =====================================================================
+  const [birthInputMode, setBirthInputMode] = useState<'calendar' | 'manual'>('calendar');
+  const [birthDateString, setBirthDateString] = useState<string>('2000-01-01');
+  const [manualDay, setManualDay] = useState<string>('1');
+  const [manualMonth, setManualMonth] = useState<string>('1');
+  const [manualYear, setManualYear] = useState<string>('2000');
+
+  // Official CAPMAS Egypt Population State
+  const [egyptPopulation, setEgyptPopulation] = useState<number | null>(null);
+  const [popFetchedAt, setPopFetchedAt] = useState<string | null>(null);
+  const [isFetchingPop, setIsFetchingPop] = useState<boolean>(false);
+  const [popError, setPopError] = useState<string | null>(null);
+
+  const fetchOfficialEgyptPopulation = useCallback(async (showSpinner = false) => {
+    try {
+      if (showSpinner) setIsFetchingPop(true);
+      setPopError(null);
+      const res = await fetch('/api/egypt-population', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Failed to fetch official population');
+      const data = await res.json();
+      if (typeof data.population === 'number' && data.population > 0) {
+        setEgyptPopulation(data.population);
+        setPopFetchedAt(
+          new Date().toLocaleTimeString('ar-EG', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true,
+          })
+        );
+      }
+    } catch {
+      setPopError('جاري إعادة الاتصال بخادم الساعة السكانية الرسمي...');
+    } finally {
+      if (showSpinner) setIsFetchingPop(false);
+    }
+  }, []);
+
+  // Poll official CAPMAS endpoint every 5 seconds
+  useEffect(() => {
+    fetchOfficialEgyptPopulation(true);
+    const interval = setInterval(() => {
+      fetchOfficialEgyptPopulation(false);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [fetchOfficialEgyptPopulation]);
+
+  // Synchronize calendar picker and manual inputs
+  const handleCalendarDateChange = (val: string) => {
+    setBirthDateString(val);
+    if (val) {
+      const parts = val.split('-');
+      if (parts.length === 3) {
+        setManualYear(parts[0]);
+        setManualMonth(String(parseInt(parts[1], 10)));
+        setManualDay(String(parseInt(parts[2], 10)));
+      }
+    }
+  };
+
+  const handleManualDateChange = (dayStr: string, monthStr: string, yearStr: string) => {
+    setManualDay(dayStr);
+    setManualMonth(monthStr);
+    setManualYear(yearStr);
+
+    const y = parseInt(yearStr, 10);
+    const m = parseInt(monthStr, 10);
+    const d = parseInt(dayStr, 10);
+
+    if (
+      !isNaN(y) &&
+      y >= 1900 &&
+      y <= 2100 &&
+      !isNaN(m) &&
+      m >= 1 &&
+      m <= 12 &&
+      !isNaN(d) &&
+      d >= 1 &&
+      d <= 31
+    ) {
+      const paddedM = String(m).padStart(2, '0');
+      const paddedD = String(d).padStart(2, '0');
+      setBirthDateString(`${y}-${paddedM}-${paddedD}`);
+    }
+  };
+
+  // Real-time Age Calculation (updates every second via `currentTime`)
+  const ageCalculation = useMemo(() => {
+    if (!birthDateString) return null;
+    const parts = birthDateString.split('-').map(Number);
+    if (parts.length !== 3 || parts.some(isNaN)) return null;
+
+    const [bYear, bMonth, bDay] = parts;
+    const birthDate = new Date(bYear, bMonth - 1, bDay, 0, 0, 0);
+    if (isNaN(birthDate.getTime()) || birthDate.getTime() > currentTime.getTime()) {
+      return null;
+    }
+
+    let years = currentTime.getFullYear() - birthDate.getFullYear();
+    let months = currentTime.getMonth() - birthDate.getMonth();
+    let days = currentTime.getDate() - birthDate.getDate();
+
+    if (days < 0) {
+      months -= 1;
+      const prevMonth = new Date(currentTime.getFullYear(), currentTime.getMonth(), 0);
+      days += prevMonth.getDate();
+    }
+    if (months < 0) {
+      years -= 1;
+      months += 12;
+    }
+
+    const hours = currentTime.getHours();
+    const minutes = currentTime.getMinutes();
+    const seconds = currentTime.getSeconds();
+
+    const diffMs = currentTime.getTime() - birthDate.getTime();
+    const totalSeconds = Math.floor(diffMs / 1000);
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const totalHours = Math.floor(totalMinutes / 60);
+    const totalDays = Math.floor(totalHours / 24);
+
+    return {
+      years,
+      months,
+      days,
+      hours,
+      minutes,
+      seconds,
+      totalDays,
+      totalHours,
+      totalMinutes,
+      totalSeconds,
+    };
+  }, [birthDateString, currentTime]);
 
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === selectedProjectId) || null,
@@ -137,7 +369,6 @@ export default function App() {
     }
   }, []);
 
-  // تشغيل دالة الجلب مرة واحدة عند تحميل الصفحة
   useEffect(() => {
     fetchProjects();
   }, [fetchProjects]);
@@ -178,7 +409,7 @@ export default function App() {
     setFormError('');
   };
 
-  // 3. دالة لحفظ مشروع جديد في فايربيز (مربوطة بزر "حفظ" في الشاشة المنبثقة)
+  // 3. دالة لحفظ مشروع جديد في فايربيز
   const handleSaveProject = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -206,7 +437,6 @@ export default function App() {
     try {
       setIsSubmitting(true);
       await addDoc(collection(db, 'projects'), newProjectData);
-      console.log('تم حفظ المشروع في فايربيز بنجاح!');
       resetAddForm();
       setIsAddModalOpen(false);
       showToast('تم حفظ المشروع في فايربيز بنجاح!');
@@ -277,12 +507,11 @@ export default function App() {
     }
   };
 
-  // 4. دالة لحذف مشروع من فايربيز (مربوطة بزر "حذف" في شاشة التفاصيل)
+  // 4. دالة لحذف مشروع من فايربيز
   const handleDeleteProject = async (projectId: string) => {
     try {
       setIsSubmitting(true);
       await deleteDoc(doc(db, 'projects', projectId));
-      console.log('تم الحذف بنجاح');
       setSelectedProjectId(null);
       setIsEditingInModal(false);
       showToast('تم حذف المشروع من السحابة بنجاح');
@@ -302,15 +531,14 @@ export default function App() {
       setIsAuthenticated(true);
       setPasswordInput('');
       setPasswordError(false);
-      setIsSettingsModalOpen(false);
-      showToast('تم تسجيل الدخول وإظهار جميع الروابط');
+      showToast('تم تسجيل الدخول وتفعيل الإعدادات');
     } else {
       setPasswordError(true);
       setPasswordInput('');
     }
   };
 
-  // Filtered Projects
+  // Real-time Filtered Projects by any typed characters
   const filteredProjects = useMemo(() => {
     return projects.filter((proj) => {
       if (!searchQuery.trim()) return true;
@@ -325,19 +553,6 @@ export default function App() {
       );
     });
   }, [projects, searchQuery, isAuthenticated]);
-
-  // Total Registered Links Counter
-  const totalRegisteredLinks = useMemo(() => {
-    return projects.reduce(
-      (acc, p) =>
-        acc +
-        (p.liveUrl ? 1 : 0) +
-        (p.githubUrl ? 1 : 0) +
-        (p.vercelUrl ? 1 : 0) +
-        (p.firebaseUrl ? 1 : 0),
-      0
-    );
-  }, [projects]);
 
   // Close modals on Escape key
   useEffect(() => {
@@ -357,36 +572,53 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isAddModalOpen, selectedProjectId, isSettingsModalOpen, isMobileSidebarOpen]);
 
-  const formatUrlLabel = (url: string, fallback: string) => {
-    if (!url) return fallback;
-    try {
-      const normalized = url.startsWith('http') ? url : `https://${url}`;
-      const parsed = new URL(normalized);
-      return `${parsed.hostname}${parsed.pathname !== '/' ? parsed.pathname : ''}`;
-    } catch {
-      return url;
-    }
-  };
-
   const ensureProtocol = (url: string) => {
     if (!url) return '#';
     return url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
   };
 
-  // Reusable Sidebar Content (used in both Desktop static sidebar and Mobile drawer)
+  const getWhatsAppUrl = (phone: string) => {
+    const cleaned = (phone || '').replace(/[^0-9]/g, '');
+    if (!cleaned) return 'https://wa.me/';
+    return `https://wa.me/${cleaned}`;
+  };
+
+  // Formatted Live Day, Date, and 12-Hour Clock
+  const formattedDayName = useMemo(() => {
+    return currentTime.toLocaleDateString('ar-EG', { weekday: 'long' });
+  }, [currentTime]);
+
+  const formattedDate = useMemo(() => {
+    return currentTime.toLocaleDateString('ar-EG', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  }, [currentTime]);
+
+  const formatted12HourTime = useMemo(() => {
+    return currentTime.toLocaleTimeString('ar-EG', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
+  }, [currentTime]);
+
+  // Reusable Sidebar Content
   const renderSidebarContent = () => (
     <div className="glow-sidebar rounded-2xl p-6 flex flex-col justify-between h-full gap-8">
       {/* Top Brand & Control Panel */}
       <div className="space-y-7">
         {/* Brand Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-5">
-          <div className="flex items-center gap-3.5">
-            <div className="h-11 w-11 rounded-xl bg-sky-500/15 border border-sky-400/40 flex items-center justify-center shadow-[0_0_20px_rgba(56,189,248,0.25)]">
+          <div className="flex items-center gap-3.5 min-w-0">
+            <div className="h-11 w-11 shrink-0 rounded-xl bg-sky-500/15 border border-sky-400/40 flex items-center justify-center shadow-[0_0_20px_rgba(56,189,248,0.25)]">
               <Layers className="w-5 h-5 text-sky-300" />
             </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight text-white">
-                لوحة المشاريع
+            <div className="min-w-0">
+              <h1 className="text-base font-bold tracking-tight text-white truncate">
+                {siteConfig.siteName}
               </h1>
               <p className="text-xs text-slate-400">
                 المعرض الشخصي وإدارة الروابط
@@ -399,7 +631,7 @@ export default function App() {
             type="button"
             onClick={() => setIsMobileSidebarOpen(false)}
             aria-label="إغلاق القائمة الجانبية"
-            className="lg:hidden h-9 w-9 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] border border-white/10 text-slate-300 hover:text-white flex items-center justify-center cursor-pointer"
+            className="lg:hidden h-9 w-9 shrink-0 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] border border-white/10 text-slate-300 hover:text-white flex items-center justify-center cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -421,89 +653,127 @@ export default function App() {
           </button>
         </div>
 
-        {/* Navigation Item: جميع المشاريع */}
+        {/* Navigation Items: جميع المشاريع + احسب عمرك (تظهر للجميع) */}
         <div className="space-y-2">
           <p className="text-xs font-medium text-slate-400 px-2 pb-1">
             القائمة الرئيسية
           </p>
-          <nav className="space-y-1.5">
+          <nav className="space-y-2">
+            {/* جميع المشاريع */}
             <button
               type="button"
               onClick={() => {
+                setActiveView('projects');
                 setSearchQuery('');
                 setIsMobileSidebarOpen(false);
               }}
-              className="w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-150 cursor-pointer bg-sky-500/18 text-sky-200 border border-sky-400/50 shadow-[0_0_18px_rgba(56,189,248,0.22)]"
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-150 cursor-pointer ${
+                activeView === 'projects'
+                  ? 'bg-sky-500/18 text-sky-200 border border-sky-400/50 shadow-[0_0_18px_rgba(56,189,248,0.22)]'
+                  : 'text-slate-300 hover:text-white hover:bg-white/[0.04] border border-transparent hover:border-sky-400/30'
+              }`}
             >
               <span className="flex items-center gap-3 whitespace-nowrap">
-                <FolderKanban className="w-4 h-4 text-sky-300" />
+                <FolderKanban
+                  className={`w-4 h-4 ${
+                    activeView === 'projects' ? 'text-sky-300' : 'text-slate-400'
+                  }`}
+                />
                 <span>جميع المشاريع</span>
               </span>
               <span className="font-mono text-xs tabular-nums text-sky-200">
                 {projects.length}
               </span>
             </button>
+
+            {/* احسب عمرك (تظهر للجميع) */}
+            <button
+              type="button"
+              onClick={() => {
+                setActiveView('age');
+                setIsMobileSidebarOpen(false);
+              }}
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-150 cursor-pointer ${
+                activeView === 'age'
+                  ? 'bg-sky-500/18 text-sky-200 border border-sky-400/50 shadow-[0_0_18px_rgba(56,189,248,0.22)]'
+                  : 'text-slate-300 hover:text-white hover:bg-white/[0.04] border border-transparent hover:border-sky-400/30'
+              }`}
+            >
+              <span className="flex items-center gap-3 whitespace-nowrap">
+                <Calculator
+                  className={`w-4 h-4 ${
+                    activeView === 'age' ? 'text-sky-300' : 'text-slate-400'
+                  }`}
+                />
+                <span>احسب عمرك</span>
+              </span>
+              <Clock className="w-3.5 h-3.5 text-sky-400/80" />
+            </button>
           </nav>
         </div>
       </div>
 
-      {/* Sidebar Bottom Platform Links & Settings */}
+      {/* Sidebar Bottom Platform Links (مخفية عن المستخدمين وتظهر فقط عند تسجيل الدخول من الإعدادات) & Settings */}
       <div className="space-y-2.5 pt-6 border-t border-white/10">
-        {/* 1. فتح منصة Google Studio */}
-        <a
-          href="https://aistudio.google.com/"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
-        >
-          <span className="flex items-center gap-2">
-            <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-            <span>فتح منصة Google Studio</span>
-          </span>
-          <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
-        </a>
+        {isAuthenticated && (
+          <>
+            {/* 1. فتح منصة Google Studio */}
+            <a
+              href="https://aistudio.google.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
+            >
+              <span className="flex items-center gap-2">
+                <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                <span>فتح منصة Google Studio</span>
+              </span>
+              <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
+            </a>
 
-        {/* 2. فتح منصة Vercel */}
-        <a
-          href="https://vercel.com/"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
-        >
-          <span className="flex items-center gap-2">
-            <Triangle className="w-3.5 h-3.5 text-cyan-300" />
-            <span>فتح منصة Vercel</span>
-          </span>
-          <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
-        </a>
+            {/* 2. فتح منصة Vercel */}
+            <a
+              href="https://vercel.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
+            >
+              <span className="flex items-center gap-2">
+                <Triangle className="w-3.5 h-3.5 text-cyan-300" />
+                <span>فتح منصة Vercel</span>
+              </span>
+              <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
+            </a>
 
-        {/* 3. فتح منصة GitHub */}
-        <a
-          href="https://github.com/"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
-        >
-          <span className="flex items-center gap-2">
-            <Github className="w-3.5 h-3.5 text-slate-200" />
-            <span>فتح منصة GitHub</span>
-          </span>
-          <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
-        </a>
+            {/* 3. فتح منصة GitHub */}
+            <a
+              href="https://github.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
+            >
+              <span className="flex items-center gap-2">
+                <Github className="w-3.5 h-3.5 text-slate-200" />
+                <span>فتح منصة GitHub</span>
+              </span>
+              <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
+            </a>
 
-        {/* 4. فتح منصة فاير بيز السحابي */}
-        <a
-          href="https://console.firebase.google.com/"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
-        >
-          <span className="flex items-center gap-2">
-            <Flame className="w-3.5 h-3.5 text-amber-400" />
-            <span>فتح منصة فاير بيز السحابي</span>
-          </span>
-          <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
-        </a>
+            {/* 4. فتح منصة فاير بيز السحابي */}
+            <a
+              href="https://console.firebase.google.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between group"
+            >
+              <span className="flex items-center gap-2">
+                <Flame className="w-3.5 h-3.5 text-amber-400" />
+                <span>فتح منصة فاير بيز السحابي</span>
+              </span>
+              <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300 transition-transform group-hover:-translate-x-0.5 group-hover:-translate-y-0.5" />
+            </a>
+          </>
+        )}
 
         {/* Settings Button (زر الإعدادات) */}
         <button
@@ -531,7 +801,7 @@ export default function App() {
   );
 
   return (
-    <div className="relative min-h-screen w-full bg-[#060B19] text-slate-100 flex flex-col lg:flex-row overflow-x-hidden">
+    <div className="relative min-h-screen w-full max-w-full bg-[#060B19] text-slate-100 flex flex-col lg:flex-row overflow-x-hidden">
       {/* Deep Navy Ambient Lighting */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
         <div className="absolute -top-40 -right-40 h-[520px] w-[520px] rounded-full bg-sky-500/12 blur-[130px]" />
@@ -544,7 +814,7 @@ export default function App() {
         {renderSidebarContent()}
       </aside>
 
-      {/* MOBILE DRAWER SIDEBAR (3 شرط جانبية وتغلق عند الضغط على أي مكان في الشاشة) */}
+      {/* MOBILE DRAWER SIDEBAR */}
       <AnimatePresence>
         {isMobileSidebarOpen && (
           <motion.div
@@ -574,13 +844,16 @@ export default function App() {
         onClick={() => {
           if (isMobileSidebarOpen) setIsMobileSidebarOpen(false);
         }}
-        className="relative z-10 flex-1 p-4 sm:p-6 lg:p-8 flex flex-col justify-between gap-6 max-w-[1440px]"
+        className="relative z-10 flex-1 min-w-0 p-3 sm:p-6 lg:p-8 flex flex-col justify-between gap-5 max-w-[1440px] overflow-x-hidden"
       >
-        <div className="flex flex-col gap-6 flex-1">
-          {/* Top Workspace Header */}
-          <header className="glass-panel rounded-2xl px-5 sm:px-6 py-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div className="flex items-start sm:items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
+        <div className="flex flex-col gap-5 flex-1 min-w-0">
+          {/* Top Workspace Header:
+              - على اليمين: زر القائمة للهاتف + اسم الموقع
+              - بالأعلى على اليسار (مكان خانة البحث سابقاً): اليوم والتاريخ والساعة بنظام 12 ساعة */}
+          <header className="glass-panel rounded-2xl px-4 sm:px-6 py-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+            {/* Right side of header: Mobile Menu + Site Name + Mobile Settings */}
+            <div className="flex items-center justify-between gap-2 min-w-0">
+              <div className="flex items-center gap-2.5 min-w-0">
                 {/* Mobile 3-Bars Hamburger Button */}
                 <button
                   type="button"
@@ -589,18 +862,15 @@ export default function App() {
                     setIsMobileSidebarOpen(true);
                   }}
                   aria-label="فتح القائمة الجانبية"
-                  className="lg:hidden h-10 w-10 shrink-0 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 border border-sky-400/40 flex items-center justify-center text-sky-300 shadow-[0_0_16px_rgba(56,189,248,0.25)] cursor-pointer"
+                  className="lg:hidden h-9 w-9 shrink-0 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 border border-sky-400/40 flex items-center justify-center text-sky-300 shadow-[0_0_16px_rgba(56,189,248,0.25)] cursor-pointer"
                 >
                   <Menu className="w-5 h-5" />
                 </button>
 
-                <div className="space-y-1">
-                  <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
-                    معرض المشاريع البرمجية
+                <div className="min-w-0">
+                  <h2 className="text-base sm:text-xl font-bold text-white tracking-tight truncate">
+                    {siteConfig.siteName}
                   </h2>
-                  <p className="text-xs sm:text-sm text-slate-300">
-                    اضغط على أي قالب مشروع لعرض التفاصيل
-                  </p>
                 </div>
               </div>
 
@@ -614,33 +884,30 @@ export default function App() {
                 }}
                 aria-label="الإعدادات"
                 title="الإعدادات"
-                className="md:hidden h-10 w-10 shrink-0 rounded-xl bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 flex items-center justify-center text-slate-300 hover:text-sky-300 transition-all cursor-pointer"
+                className="md:hidden h-9 w-9 shrink-0 rounded-xl bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 flex items-center justify-center text-slate-300 hover:text-sky-300 transition-all cursor-pointer"
               >
-                <Settings className="w-5 h-5" />
+                <Settings className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Search Input + Settings Button */}
-            <div className="flex items-center gap-3 w-full md:w-auto">
-              <div className="relative flex-1 md:w-72">
-                <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="ابحث في وصف المشاريع..."
-                  className="glass-input w-full pr-10 pl-8 py-2.5 rounded-xl text-sm text-white placeholder:text-slate-400"
-                />
-                {searchQuery && (
-                  <button
-                    type="button"
-                    onClick={() => setSearchQuery('')}
-                    aria-label="مسح البحث"
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1 cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
+            {/* Left side of header (على اليسار بالأعلى مكان خانة البحث): اليوم والتاريخ والساعة في سطر واحد */}
+            <div className="flex items-center justify-between md:justify-end gap-2.5 w-full md:w-auto">
+              <div className="glass-card-interactive flex-1 md:flex-initial px-3 sm:px-4 py-2 rounded-xl flex items-center justify-between md:justify-center gap-2 sm:gap-3 text-[11px] sm:text-xs border border-sky-400/25 whitespace-nowrap overflow-hidden">
+                <div className="flex items-center gap-1 text-sky-300 font-semibold shrink-0">
+                  <Calendar className="w-3.5 h-3.5 text-sky-400 shrink-0 hidden sm:inline" />
+                  <span>{formattedDayName}</span>
+                </div>
+                <span className="text-white/20 shrink-0" aria-hidden="true">
+                  ·
+                </span>
+                <span className="text-slate-200 font-medium shrink-0">{formattedDate}</span>
+                <span className="text-white/20 shrink-0" aria-hidden="true">
+                  ·
+                </span>
+                <div className="flex items-center gap-1 font-mono tabular-nums text-cyan-300 font-semibold bg-sky-500/10 px-2 py-0.5 rounded-lg border border-sky-400/25 shrink-0">
+                  <Clock className="w-3 h-3 text-sky-400 shrink-0 hidden sm:inline" />
+                  <span>{formatted12HourTime}</span>
+                </div>
               </div>
 
               <button
@@ -660,231 +927,542 @@ export default function App() {
             </div>
           </header>
 
-          {/* PROJECTS DISPLAY AREA */}
-          <section aria-label="قائمة المشاريع" className="flex-1 flex flex-col gap-4">
-            {/* Top Stats Bar: المشاريع المعروضة + إجمالي المشاريع المحفوظة + إجمالي الروابط المسجلة */}
-            <div className="glass-panel rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-4">
-              <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
-                {/* المشاريع المعروضة */}
-                <div className="flex items-center gap-2 text-slate-300">
-                  <span>المشاريع المعروضة</span>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums text-sky-300 font-semibold">
-                    {filteredProjects.length}
-                  </span>
-                  <span>من أصل</span>
-                  <span className="font-mono tabular-nums text-slate-200 font-semibold">
-                    {projects.length}
-                  </span>
+          {/* =====================================================================
+              CONDITIONAL VIEW: EITHER PROJECTS OR AGE CALCULATOR ("احسب عمرك")
+          ====================================================================== */}
+          {activeView === 'age' ? (
+            /* =================================================================
+               "احسب عمرك" في نسخة الهاتف والكمبيوتر بالترتيب المطلوب:
+               1. التاريخ يظهر في سطر واحد (اليوم والتاريخ والساعة)
+               2. أسفلها الساعة السكانية الرسمية
+               3. أسفلها سجل تاريخك
+               4. وعمرك الحالي بالتفصيل (محدث لحظياً) بالتاريخ يظهروا في سطر واحد بدون مسطرة تحريك
+               5. السن والشهر واليوم في سطر واحد بجانب بعض، أسفلهم الساعة والدقائق والثواني
+            ================================================================== */
+            <section
+              aria-label="احسب عمرك والساعة السكانية"
+              className="flex-1 flex flex-col gap-4 w-full max-w-full overflow-x-hidden"
+            >
+              {/* 1. التاريخ يظهر في سطر واحد: اليوم والتاريخ والساعة */}
+              <div className="glass-panel rounded-2xl px-3 sm:px-6 py-3.5 border border-sky-400/30 flex items-center justify-between gap-2 whitespace-nowrap overflow-hidden">
+                <div className="flex items-center gap-1.5 text-xs sm:text-sm font-bold text-sky-300 shrink-0">
+                  <Calendar className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span>{formattedDayName}</span>
                 </div>
 
-                <span className="hidden sm:inline text-white/15" aria-hidden="true">
-                  |
+                <span className="text-xs sm:text-sm font-semibold text-slate-100 shrink-0">
+                  {formattedDate}
                 </span>
 
-                {/* إجمالي المشاريع المحفوظة */}
-                <div className="flex items-center gap-2 text-slate-300">
-                  <span>إجمالي المشاريع المحفوظة</span>
-                  <span className="font-mono font-semibold text-sky-300 tabular-nums">
-                    {projects.length}
-                  </span>
-                </div>
-
-                <span className="hidden sm:inline text-white/15" aria-hidden="true">
-                  |
-                </span>
-
-                {/* إجمالي الروابط المسجلة */}
-                <div className="flex items-center gap-2 text-slate-300">
-                  <span>إجمالي الروابط المسجلة</span>
-                  <span className="font-mono font-semibold text-sky-300 tabular-nums">
-                    {totalRegisteredLinks}
-                  </span>
+                <div className="flex items-center gap-1.5 font-mono tabular-nums text-xs sm:text-sm text-cyan-300 font-bold bg-sky-500/12 px-2.5 py-1 rounded-xl border border-sky-400/30 shrink-0">
+                  <Clock className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                  <span>{formatted12HourTime}</span>
                 </div>
               </div>
-            </div>
 
-            {isLoading ? (
-              <div className="glass-panel rounded-2xl p-12 text-center my-auto flex flex-col items-center justify-center gap-4">
-                <Loader2 className="w-8 h-8 text-sky-400 animate-spin" />
-                <p className="text-sm text-slate-300">جاري تحميل المشاريع من قاعدة البيانات...</p>
-              </div>
-            ) : filteredProjects.length === 0 ? (
-              <div className="glass-panel rounded-2xl p-12 text-center my-auto flex flex-col items-center justify-center gap-4">
-                <div className="h-14 w-14 rounded-2xl bg-sky-500/10 border border-sky-400/30 flex items-center justify-center shadow-[0_0_24px_rgba(56,189,248,0.18)]">
-                  <Code2 className="w-7 h-7 text-sky-300" />
+              {/* 2. أسفلها: الساعة السكانية الرسمية */}
+              <div className="glass-modal w-full rounded-2xl p-4 sm:p-6 space-y-4 border border-sky-400/40 shadow-[0_0_30px_rgba(56,189,248,0.18)]">
+                <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="h-9 w-9 sm:h-10 sm:w-10 shrink-0 rounded-xl bg-sky-500/20 border border-sky-400/50 flex items-center justify-center shadow-[0_0_16px_rgba(56,189,248,0.3)]">
+                      <Users className="w-4 h-4 sm:w-5 sm:h-5 text-sky-300" />
+                    </div>
+                    <div className="min-w-0">
+                      <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                        الساعة السكانية الرسمية
+                      </h3>
+                      <p className="text-[11px] sm:text-xs text-slate-300 truncate">
+                        عدد سكان جمهورية مصر العربية محدث لحظياً من الموقع الرسمي
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => fetchOfficialEgyptPopulation(true)}
+                    title="تحديث الآن من المصدر الرسمي"
+                    className="h-8 w-8 sm:h-9 sm:w-9 shrink-0 rounded-xl bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-sky-300 flex items-center justify-center transition-all cursor-pointer"
+                  >
+                    <RefreshCw
+                      className={`w-4 h-4 ${isFetchingPop ? 'animate-spin' : ''}`}
+                    />
+                  </button>
                 </div>
-                <div className="space-y-1.5 max-w-md">
-                  <h3 className="text-lg font-semibold text-white">
-                    {searchQuery
-                      ? 'لا توجد مشاريع مطابقة لبحثك'
-                      : 'لا توجد مشاريع مضافة حتى الآن'}
-                  </h3>
-                  <p className="text-sm text-slate-400 leading-relaxed">
-                    {searchQuery
-                      ? 'جرب تغيير كلمات البحث لعرض جميع القوالب.'
-                      : 'ابدأ بإضافة مشروعك الأول من خلال الزر المضيء في القائمة الجانبية ليتم حفظه في فايربيز.'}
+
+                {/* Official Population Number Display */}
+                <div className="glass-panel rounded-xl p-4 text-center space-y-2 border border-sky-400/30 bg-[#040814]/80">
+                  <p className="text-[11px] sm:text-xs font-medium text-sky-300">
+                    إجمالي عدد سكان جمهورية مصر العربية الآن (نسمة)
                   </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (searchQuery) {
-                      setSearchQuery('');
-                    } else {
-                      resetAddForm();
-                      setIsAddModalOpen(true);
-                    }
-                  }}
-                  className="glow-button-primary mt-2 py-2.5 px-5 rounded-xl text-sm font-medium text-white flex items-center gap-2 cursor-pointer"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>{searchQuery ? 'عرض جميع المشاريع' : 'أضف مشروع الآن'}</span>
-                </button>
-              </div>
-            ) : (
-              /* Horizontal Flex-row Layout for Project Cards */
-              <div className="flex flex-row flex-wrap gap-5 items-stretch">
-                <AnimatePresence mode="popLayout">
-                  {filteredProjects.map((project, index) => (
-                    <motion.article
-                      layout
-                      key={project.id}
-                      initial={{ opacity: 0, y: 12 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, scale: 0.96 }}
-                      transition={{ duration: 0.18 }}
-                      onClick={() => handleOpenDetails(project)}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          handleOpenDetails(project);
-                        }
-                      }}
-                      className="glass-card-interactive group w-full rounded-2xl p-5 sm:p-6 cursor-pointer flex flex-col xl:flex-row xl:items-center justify-between gap-5 text-right focus:outline-none"
-                    >
-                      {/* Right Section: Number + Project Description */}
-                      <div className="flex items-start gap-4 flex-1 min-w-0">
-                        <div className="h-12 w-12 shrink-0 rounded-xl bg-sky-500/12 border border-sky-400/30 group-hover:border-sky-300/70 group-hover:bg-sky-500/20 flex items-center justify-center font-mono text-sm font-semibold text-sky-300 tabular-nums transition-all shadow-[0_0_15px_rgba(56,189,248,0.12)] group-hover:shadow-[0_0_22px_rgba(56,189,248,0.35)]">
-                          {String(index + 1).padStart(2, '0')}
-                        </div>
 
-                        <div className="space-y-2 flex-1 min-w-0">
-                          <div className="flex items-center gap-2 text-xs text-slate-400">
-                            <span className="text-sky-300 font-medium">وصف الموقع</span>
-                            {project.createdAt && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono tabular-nums">{project.createdAt}</span>
-                              </>
-                            )}
-                          </div>
-                          <p className="text-base sm:text-lg font-medium text-slate-100 group-hover:text-white leading-relaxed">
-                            {project.description}
-                          </p>
+                  {egyptPopulation ? (
+                    <div
+                      dir="ltr"
+                      className="text-2xl sm:text-4xl font-extrabold font-mono tabular-nums tracking-wider text-white drop-shadow-[0_0_18px_rgba(56,189,248,0.45)]"
+                    >
+                      {egyptPopulation.toLocaleString('en-US')}
+                    </div>
+                  ) : (
+                    <div className="py-2 flex items-center justify-center gap-2 text-xs sm:text-sm text-slate-300">
+                      <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+                      <span>جاري الجلب المباشر من الموقع الرسمي...</span>
+                    </div>
+                  )}
+
+                  {popError && <p className="text-[11px] text-amber-300">{popError}</p>}
+
+                  {popFetchedAt && (
+                    <p className="text-[10px] sm:text-[11px] text-slate-400">
+                      آخر تحديث رسمي (CAPMAS):{' '}
+                      <span className="font-mono text-sky-300">{popFetchedAt}</span>
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* 3. أسفلها: سجل تاريخ ميلادك */}
+              <div className="glass-panel rounded-2xl p-4 sm:p-6 space-y-4 border border-sky-400/20">
+                <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="h-8 w-8 sm:h-9 sm:w-9 shrink-0 rounded-xl bg-sky-500/15 border border-sky-400/40 flex items-center justify-center">
+                      <Calculator className="w-4 h-4 text-sky-300" />
+                    </div>
+                    <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                      سجل تاريخ ميلادك
+                    </h3>
+                  </div>
+
+                  {/* Toggle Input Method */}
+                  <div className="flex items-center gap-1 p-1 rounded-xl bg-[#050914]/70 border border-white/10 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setBirthInputMode('calendar')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${
+                        birthInputMode === 'calendar'
+                          ? 'bg-sky-500/25 text-sky-200 border border-sky-400/40'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      من النتيجة
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBirthInputMode('manual')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${
+                        birthInputMode === 'manual'
+                          ? 'bg-sky-500/25 text-sky-200 border border-sky-400/40'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      يدوياً
+                    </button>
+                  </div>
+                </div>
+
+                {birthInputMode === 'calendar' ? (
+                  <div>
+                    <input
+                      id="birth-calendar-input"
+                      type="date"
+                      value={birthDateString}
+                      max={new Date().toISOString().split('T')[0]}
+                      onChange={(e) => handleCalendarDateChange(e.target.value)}
+                      className="glass-input w-full px-3.5 py-2.5 rounded-xl text-sm sm:text-base font-mono text-white cursor-pointer"
+                    />
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-3 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-sky-300 text-center">
+                        اليوم
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={31}
+                        value={manualDay}
+                        onChange={(e) =>
+                          handleManualDateChange(e.target.value, manualMonth, manualYear)
+                        }
+                        placeholder="اليوم"
+                        className="glass-input w-full px-2 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-center"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-sky-300 text-center">
+                        الشهر
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={12}
+                        value={manualMonth}
+                        onChange={(e) =>
+                          handleManualDateChange(manualDay, e.target.value, manualYear)
+                        }
+                        placeholder="الشهر"
+                        className="glass-input w-full px-2 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-center"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-sky-300 text-center">
+                        السنة
+                      </label>
+                      <input
+                        type="number"
+                        min={1900}
+                        max={new Date().getFullYear()}
+                        value={manualYear}
+                        onChange={(e) =>
+                          handleManualDateChange(manualDay, manualMonth, e.target.value)
+                        }
+                        placeholder="السنة"
+                        className="glass-input w-full px-2 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-center"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* 4. عمرك الحالي بالتفصيل (محدث لحظياً) بالتاريخ في سطر واحد
+                  5. السن والشهر واليوم في سطر واحد بجانب بعض، أسفلهم الساعة والدقائق والثواني */}
+              {ageCalculation ? (
+                <>
+                  <div className="glass-panel rounded-2xl p-4 sm:p-6 space-y-4 border border-sky-400/25 overflow-hidden">
+                    {/* Header + Birthdate in a single line (في سطر واحد بدون مسطرة تحريك) */}
+                    <div className="flex items-center justify-between gap-2 whitespace-nowrap border-b border-white/10 pb-3">
+                      <h4 className="text-xs sm:text-base font-bold text-white flex items-center gap-1.5 truncate">
+                        <Sparkles className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sky-400 shrink-0" />
+                        <span className="truncate">عمرك الحالي بالتفصيل (محدث لحظياً)</span>
+                      </h4>
+                      <span
+                        dir="ltr"
+                        className="text-xs sm:text-sm font-mono font-semibold text-sky-300 tabular-nums bg-sky-500/10 px-2.5 py-1 rounded-lg border border-sky-400/25 shrink-0"
+                      >
+                        {birthDateString}
+                      </span>
+                    </div>
+
+                    {/* السطر الأول: السن والشهر واليوم في سطر واحد بجانب بعض */}
+                    <div className="grid grid-cols-3 gap-2.5 sm:gap-4">
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-sky-300">
+                          {ageCalculation.years}
+                        </div>
+                        <div className="text-[11px] sm:text-xs text-slate-300 font-medium">
+                          السن
                         </div>
                       </div>
 
-                      {/* Left Section: Conditional based on Authentication */}
-                      {isAuthenticated ? (
-                        <div className="flex flex-wrap sm:flex-nowrap items-center gap-3 xl:shrink-0 pt-3 xl:pt-0 border-t xl:border-t-0 border-white/10">
-                          {/* Live URL Quick Indicator */}
-                          <div
-                            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono border transition-colors ${
-                              project.liveUrl
-                                ? 'bg-white/[0.04] border-white/10 text-slate-200 group-hover:border-sky-400/35'
-                                : 'bg-white/[0.01] border-white/5 text-slate-500'
-                            }`}
-                          >
-                            <Globe className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                            <span className="truncate max-w-[130px]" dir="ltr">
-                              {formatUrlLabel(project.liveUrl, 'بدون رابط موقع')}
-                            </span>
-                          </div>
-
-                          {/* GitHub Quick Indicator */}
-                          <div
-                            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono border transition-colors ${
-                              project.githubUrl
-                                ? 'bg-white/[0.04] border-white/10 text-slate-200 group-hover:border-sky-400/35'
-                                : 'bg-white/[0.01] border-white/5 text-slate-500'
-                            }`}
-                          >
-                            <Github className="w-3.5 h-3.5 text-slate-300 shrink-0" />
-                            <span className="truncate max-w-[110px]" dir="ltr">
-                              {project.githubUrl ? 'GitHub' : 'بدون GitHub'}
-                            </span>
-                          </div>
-
-                          {/* Vercel Quick Indicator */}
-                          <div
-                            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono border transition-colors ${
-                              project.vercelUrl
-                                ? 'bg-white/[0.04] border-white/10 text-slate-200 group-hover:border-sky-400/35'
-                                : 'bg-white/[0.01] border-white/5 text-slate-500'
-                            }`}
-                          >
-                            <Triangle className="w-3.5 h-3.5 text-cyan-300 shrink-0 fill-cyan-300/20" />
-                            <span className="truncate max-w-[110px]" dir="ltr">
-                              {project.vercelUrl ? 'Vercel' : 'بدون Vercel'}
-                            </span>
-                          </div>
-
-                          {/* Firebase Quick Indicator */}
-                          <div
-                            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono border transition-colors ${
-                              project.firebaseUrl
-                                ? 'bg-white/[0.04] border-white/10 text-slate-200 group-hover:border-sky-400/35'
-                                : 'bg-white/[0.01] border-white/5 text-slate-500'
-                            }`}
-                          >
-                            <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                            <span className="truncate max-w-[110px]" dir="ltr">
-                              {project.firebaseUrl ? 'Firebase' : 'بدون Firebase'}
-                            </span>
-                          </div>
-
-                          {/* Open Details Prompt */}
-                          <div className="mr-auto xl:mr-1 flex items-center gap-1.5 text-xs font-medium text-sky-300 group-hover:text-sky-200 px-3 py-2 rounded-xl bg-sky-500/10 border border-sky-400/25 group-hover:border-sky-400/60 group-hover:shadow-[0_0_15px_rgba(56,189,248,0.25)] transition-all whitespace-nowrap">
-                            <span>التفاصيل</span>
-                            <ArrowUpLeft className="w-3.5 h-3.5" />
-                          </div>
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-sky-200">
+                          {ageCalculation.months}
                         </div>
-                      ) : (
-                        /* Visitor Mode (بدون تسجيل الباسورد): يظهر فقط وصف الموقع ونفس شكل زر فتح المنصة مثل زر فتح منصة جوجل استوديو في القائمة الجانبية */
+                        <div className="text-[11px] sm:text-xs text-slate-300 font-medium">
+                          الشهر
+                        </div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-cyan-300">
+                          {ageCalculation.days}
+                        </div>
+                        <div className="text-[11px] sm:text-xs text-slate-300 font-medium">
+                          اليوم
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* السطر الثاني أسفلهم: الساعة والدقائق والثواني في سطر واحد بجانب بعض */}
+                    <div className="grid grid-cols-3 gap-2.5 sm:gap-4">
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-white">
+                          {String(ageCalculation.hours).padStart(2, '0')}
+                        </div>
+                        <div className="text-[11px] sm:text-xs text-slate-300 font-medium">
+                          الساعة
+                        </div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-white">
+                          {String(ageCalculation.minutes).padStart(2, '0')}
+                        </div>
+                        <div className="text-[11px] sm:text-xs text-slate-300 font-medium">
+                          الدقائق
+                        </div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 sm:p-4 text-center space-y-1 border-sky-400/50 shadow-[0_0_20px_rgba(56,189,248,0.2)]">
+                        <div className="text-xl sm:text-3xl font-bold font-mono tabular-nums text-sky-400">
+                          {String(ageCalculation.seconds).padStart(2, '0')}
+                        </div>
+                        <div className="text-[11px] sm:text-xs text-sky-200 font-medium">
+                          الثواني
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* أسفلها: عدد الأيام والساعات والدقائق والثواني التي عاشها صاحب المستعلم */}
+                  <div className="glass-panel rounded-2xl p-4 sm:p-6 space-y-3.5 border border-sky-400/25 overflow-hidden">
+                    <h4 className="text-xs sm:text-base font-bold text-white flex items-center gap-2 truncate">
+                      <Clock className="w-4 h-4 text-cyan-400 shrink-0" />
+                      <span className="truncate">
+                        عدد الأيام والساعات والدقائق والثواني التي عاشها المستعلم
+                      </span>
+                    </h4>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3">
+                      <div className="glass-card-interactive rounded-xl p-3 text-center space-y-1">
                         <div
-                          className="xl:shrink-0 pt-3 xl:pt-0 border-t xl:border-t-0 border-white/10 flex items-center justify-end"
+                          dir="ltr"
+                          className="text-sm sm:text-lg font-bold font-mono tabular-nums text-sky-300 truncate"
+                        >
+                          {ageCalculation.totalDays.toLocaleString('en-US')}
+                        </div>
+                        <div className="text-[11px] text-slate-300">عدد الأيام</div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 text-center space-y-1">
+                        <div
+                          dir="ltr"
+                          className="text-sm sm:text-lg font-bold font-mono tabular-nums text-cyan-300 truncate"
+                        >
+                          {ageCalculation.totalHours.toLocaleString('en-US')}
+                        </div>
+                        <div className="text-[11px] text-slate-300">عدد الساعات</div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 text-center space-y-1">
+                        <div
+                          dir="ltr"
+                          className="text-sm sm:text-lg font-bold font-mono tabular-nums text-slate-100 truncate"
+                        >
+                          {ageCalculation.totalMinutes.toLocaleString('en-US')}
+                        </div>
+                        <div className="text-[11px] text-slate-300">عدد الدقائق</div>
+                      </div>
+
+                      <div className="glass-card-interactive rounded-xl p-3 text-center space-y-1 border-sky-400/45 shadow-[0_0_15px_rgba(56,189,248,0.18)]">
+                        <div
+                          dir="ltr"
+                          className="text-sm sm:text-lg font-bold font-mono tabular-nums text-sky-400 truncate"
+                        >
+                          {ageCalculation.totalSeconds.toLocaleString('en-US')}
+                        </div>
+                        <div className="text-[11px] text-sky-200">عدد الثواني</div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="glass-panel rounded-2xl p-6 text-center text-xs sm:text-sm text-rose-300">
+                  يرجى إدخال تاريخ ميلاد صحيح (في الماضي) لعرض الحساب اللحظي.
+                </div>
+              )}
+            </section>
+          ) : (
+            /* =================================================================
+               PROJECTS DISPLAY AREA:
+               - شريط البحث اللحظي مكان شريط الإحصائيات المحذوف
+               - عرض المشروعات في سطر واحد وفي اليسار زر "فتح المنصة"
+               - عدم إظهار روابط جيت هاب وفيركال وجوجل استوديو من الخارج حتى بعد تسجيل الدخول
+            ================================================================== */
+            <section aria-label="قائمة المشاريع" className="flex-1 flex flex-col gap-4 min-w-0">
+              {/* Live Search Bar (مكان الإحصائيات المحذوفة — فلترة لحظية بالحروف المكتوبة) */}
+              <div className="glass-panel rounded-2xl p-3 sm:p-4 border border-sky-400/25">
+                <div className="relative w-full">
+                  <Search className="w-4 h-4 text-sky-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="ابحث هنا... اكتب أي حرف لفلترة المشروعات المسجلة لحظياً"
+                    className="glass-input w-full pr-10 pl-9 py-2.5 sm:py-3 rounded-xl text-xs sm:text-sm text-white placeholder:text-slate-400"
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      aria-label="مسح البحث"
+                      className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {isLoading ? (
+                <div className="glass-panel rounded-2xl p-12 text-center my-auto flex flex-col items-center justify-center gap-4">
+                  <Loader2 className="w-8 h-8 text-sky-400 animate-spin" />
+                  <p className="text-sm text-slate-300">جاري تحميل المشاريع من قاعدة البيانات...</p>
+                </div>
+              ) : filteredProjects.length === 0 ? (
+                <div className="glass-panel rounded-2xl p-10 text-center my-auto flex flex-col items-center justify-center gap-4">
+                  <div className="h-12 w-12 rounded-2xl bg-sky-500/10 border border-sky-400/30 flex items-center justify-center shadow-[0_0_24px_rgba(56,189,248,0.18)]">
+                    <Code2 className="w-6 h-6 text-sky-300" />
+                  </div>
+                  <div className="space-y-1 max-w-md">
+                    <h3 className="text-base sm:text-lg font-semibold text-white">
+                      {searchQuery
+                        ? 'لا توجد مشاريع مطابقة للحروف المكتوبة'
+                        : 'لا توجد مشاريع مضافة حتى الآن'}
+                    </h3>
+                  </div>
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      className="glow-button-primary py-2 px-5 rounded-xl text-xs sm:text-sm font-medium text-white cursor-pointer"
+                    >
+                      عرض جميع المشاريع
+                    </button>
+                  )}
+                </div>
+              ) : (
+                /* Project Cards: سطر واحد على الهاتف والكمبيوتر، الوصف على اليمين وفي اليسار زر "فتح المنصة" فقط دون إظهار اللنكات من الخارج */
+                <div className="flex flex-col gap-3.5">
+                  <AnimatePresence mode="popLayout">
+                    {filteredProjects.map((project, index) => (
+                      <motion.article
+                        layout
+                        key={project.id}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.96 }}
+                        transition={{ duration: 0.16 }}
+                        onClick={() => handleOpenDetails(project)}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            handleOpenDetails(project);
+                          }
+                        }}
+                        className="glass-card-interactive group w-full rounded-2xl px-3.5 py-3.5 sm:px-6 sm:py-4 cursor-pointer flex flex-row items-center justify-between gap-3 text-right focus:outline-none"
+                      >
+                        {/* Right Side: Number + Single-Line Project Description */}
+                        <div className="flex items-center gap-2.5 sm:gap-4 flex-1 min-w-0">
+                          <div className="h-9 w-9 sm:h-11 sm:w-11 shrink-0 rounded-xl bg-sky-500/12 border border-sky-400/30 group-hover:border-sky-300/70 group-hover:bg-sky-500/20 flex items-center justify-center font-mono text-xs sm:text-sm font-semibold text-sky-300 tabular-nums transition-all">
+                            {String(index + 1).padStart(2, '0')}
+                          </div>
+
+                          <p className="text-xs sm:text-base font-medium text-slate-100 group-hover:text-white truncate flex-1 min-w-0">
+                            {project.description}
+                          </p>
+                        </div>
+
+                        {/* Left Side (في اليسار): زر "فتح المنصة" بنفس تصميم زر فتح منصة جوجل استوديو */}
+                        <div
+                          className="shrink-0"
                           onClick={(e) => e.stopPropagation()}
                         >
                           <a
                             href={ensureProtocol(project.liveUrl)}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="w-full sm:w-auto min-w-[200px] py-2.5 px-4 rounded-xl text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between gap-4 group/btn"
+                            className="py-2 px-3 sm:py-2.5 sm:px-4 rounded-xl text-[11px] sm:text-xs font-medium text-slate-300 hover:text-sky-200 bg-white/[0.03] hover:bg-sky-500/10 border border-white/10 hover:border-sky-400/40 transition-all flex items-center justify-between gap-2 sm:gap-3 group/btn whitespace-nowrap"
                           >
-                            <span className="flex items-center gap-2">
-                              <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                            <span className="flex items-center gap-1.5">
+                              <Sparkles className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                               <span>فتح المنصة</span>
                             </span>
-                            <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover/btn:text-sky-300 transition-transform group-hover/btn:-translate-x-0.5 group-hover/btn:-translate-y-0.5" />
+                            <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover/btn:text-sky-300 transition-transform group-hover/btn:-translate-x-0.5 group-hover/btn:-translate-y-0.5 shrink-0" />
                           </a>
                         </div>
-                      )}
-                    </motion.article>
-                  ))}
-                </AnimatePresence>
-              </div>
-            )}
-          </section>
+                      </motion.article>
+                    ))}
+                  </AnimatePresence>
+                </div>
+              )}
+            </section>
+          )}
         </div>
 
-        {/* FOOTER (أسفل الموقع باللغة الإنجليزية) */}
-        <footer className="pt-6 border-t border-white/10 text-center">
-          <p className="text-xs sm:text-sm font-medium text-slate-400 tracking-wide" dir="ltr">
-            With best regards, Developer <span className="text-sky-300 font-semibold">Amir Lamay</span>
+        {/* =====================================================================
+            BOTTOM AREA:
+            - على اليسار في الأسفل: قائمة باسم "للتواصل" (فيس بوك، انستجرام، الهاتف -> واتساب)
+            - توقيع المطور باللغة الإنجليزية
+        ====================================================================== */}
+        <footer className="pt-6 border-t border-white/10 flex flex-col md:flex-row items-center justify-between gap-6">
+          {/* Developer Signature (English) */}
+          <p
+            className="text-xs sm:text-sm font-medium text-slate-400 tracking-wide order-2 md:order-1"
+            dir="ltr"
+          >
+            With best regards, Developer{' '}
+            <span className="text-sky-300 font-semibold">Amir Lamay</span>
           </p>
+
+          {/* Bottom-Left Contact List */}
+          <div className="glass-panel rounded-2xl p-4 w-full md:w-72 space-y-2.5 border border-sky-400/25 order-1 md:order-2 mr-auto md:mr-0">
+            <h3 className="text-xs font-bold text-sky-300 px-1 pb-1 border-b border-white/10">
+              للتواصل
+            </h3>
+
+            <div className="flex flex-col gap-2">
+              {/* 1. فيس بوك */}
+              <a
+                href={ensureProtocol(siteConfig.facebookUrl)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-between px-3 py-2 rounded-xl bg-white/[0.03] hover:bg-sky-500/12 border border-white/10 hover:border-sky-400/40 transition-all group"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="h-7 w-7 rounded-lg bg-[#1877F2] flex items-center justify-center text-white shadow-sm shrink-0">
+                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+                      <path d="M22 12c0-5.523-4.477-10-10-10S2 6.477 2 12c0 4.991 3.657 9.128 8.438 9.878v-6.987h-2.54V12h2.54V9.797c0-2.506 1.492-3.89 3.777-3.89 1.094 0 2.238.195 2.238.195v2.46h-1.26c-1.243 0-1.63.771-1.63 1.562V12h2.773l-.443 2.89h-2.33v6.988C18.343 21.128 22 16.991 22 12z" />
+                    </svg>
+                  </div>
+                  <span className="text-xs font-medium text-slate-200 group-hover:text-white">
+                    فيس بوك
+                  </span>
+                </div>
+                <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300" />
+              </a>
+
+              {/* 2. انستجرام */}
+              <a
+                href={ensureProtocol(siteConfig.instagramUrl)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-between px-3 py-2 rounded-xl bg-white/[0.03] hover:bg-sky-500/12 border border-white/10 hover:border-sky-400/40 transition-all group"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="h-7 w-7 rounded-lg bg-gradient-to-tr from-[#f09433] via-[#dc2743] to-[#bc1888] flex items-center justify-center text-white shadow-sm shrink-0">
+                    <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+                      <path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z" />
+                    </svg>
+                  </div>
+                  <span className="text-xs font-medium text-slate-200 group-hover:text-white">
+                    انستجرام
+                  </span>
+                </div>
+                <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300" />
+              </a>
+
+              {/* 3. الهاتف (يفتح الواتساب في محادثة شخصية) */}
+              <a
+                href={getWhatsAppUrl(siteConfig.phoneNumber)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-between px-3 py-2 rounded-xl bg-white/[0.03] hover:bg-sky-500/12 border border-white/10 hover:border-sky-400/40 transition-all group"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="h-7 w-7 rounded-lg bg-[#25D366] flex items-center justify-center text-white shadow-sm shrink-0">
+                    <Phone className="w-3.5 h-3.5 fill-current" />
+                  </div>
+                  <span className="text-xs font-medium text-slate-200 group-hover:text-white">
+                    الهاتف
+                  </span>
+                </div>
+                <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-300" />
+              </a>
+            </div>
+          </div>
         </footer>
       </main>
 
@@ -1096,6 +1674,8 @@ export default function App() {
 
       {/* =====================================================================
           PROJECT DETAILS MODAL (الشاشة المنبثقة لتفاصيل المشروع)
+          - عند الضغط على المشروع تفتح التفاصيل
+          - في نسخة الهاتف: بدل زر النسخ يظهر زر "فتح المنصة"، والرابط نفسه يكون عبارة عن زر "فتح المنصة" ولا يظهر نص الرابط إلا عند الضغط على "تعديل" بعد الدخول من الإعدادات
       ====================================================================== */}
       <AnimatePresence>
         {selectedProject && (
@@ -1113,10 +1693,10 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.95, y: 12 }}
               transition={{ duration: 0.18 }}
               onClick={(e) => e.stopPropagation()}
-              className="glass-modal relative w-full max-w-2xl rounded-2xl p-6 sm:p-8 text-right max-h-[90vh] overflow-y-auto"
+              className="glass-modal relative w-full max-w-2xl rounded-2xl p-5 sm:p-8 text-right max-h-[90vh] overflow-y-auto"
             >
               {/* Top Action Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-5 mb-6">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4 mb-5">
                 {isAuthenticated ? (
                   <div className="flex items-center gap-2.5">
                     {/* Edit Button */}
@@ -1175,9 +1755,9 @@ export default function App() {
 
               {/* Modal Body */}
               {!isAuthenticated ? (
-                /* Visitor View (دون تسجيل الباسورد): يظهر فقط وصف الموقع ونفس شكل زر فتح المنصة مثل زر فتح منصة جوجل استوديو */
-                <div className="space-y-6">
-                  <div className="glass-panel rounded-xl p-5 space-y-2.5 border border-white/10">
+                /* Visitor View (دون تسجيل الباسورد): يظهر فقط وصف الموقع وزر فتح المنصة بنفس شكل زر فتح منصة جوجل استوديو */
+                <div className="space-y-5">
+                  <div className="glass-panel rounded-xl p-4 sm:p-5 space-y-2.5 border border-white/10">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
                         <FileText className="w-4 h-4" />
@@ -1203,6 +1783,7 @@ export default function App() {
                   </a>
                 </div>
               ) : isEditingInModal ? (
+                /* Edit Form (تظهر نصوص الروابط هنا فقط عند تعديل الرابط بعد تسجيل الدخول من الإعدادات) */
                 <form onSubmit={handleSaveEdit} className="space-y-4">
                   <div className="space-y-1.5">
                     <label className="block text-xs font-medium text-sky-300">
@@ -1305,22 +1886,35 @@ export default function App() {
                   </div>
                 </form>
               ) : (
-                /* Authenticated View: تظهر جميع اللنكات مع ميزة النسخ */
-                <div className="space-y-4">
+                /* Authenticated View inside Details Modal:
+                   - في نسخة الهاتف: بدل زر النسخ يظهر زر "فتح المنصة"، والرابط يكون عبارة عن "فتح المنصة" (لا يظهر الرابط النصي إلا في وضع التعديل أعلاه)
+                   - في نسخة الكمبيوتر (sm فما فوق): يظهر زر النسخ مع زر فتح المنصة */
+                <div className="space-y-3.5">
                   {/* Field 1: وصف الموقع */}
-                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10 hover:border-sky-400/35 transition-colors">
+                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
                         <FileText className="w-4 h-4" />
                         <span>وصف الموقع</span>
                       </span>
 
+                      {/* Mobile: زر فتح المنصة بدل زر النسخ | Desktop: زر نسخ */}
+                      <a
+                        href={ensureProtocol(selectedProject.liveUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="sm:hidden px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                        <span>فتح المنصة</span>
+                      </a>
+
                       <button
                         type="button"
                         onClick={() =>
                           handleCopy(selectedProject.description, 'وصف الموقع', 'desc')
                         }
-                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
+                        className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
                         title="نسخ الوصف"
                       >
                         {copiedFieldKey === 'desc' ? (
@@ -1342,221 +1936,187 @@ export default function App() {
                   </div>
 
                   {/* Field 2: لينك الموقع (Live URL) */}
-                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10 hover:border-sky-400/35 transition-colors">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
-                        <Globe className="w-4 h-4" />
-                        <span>لينك الموقع (Live URL)</span>
-                      </span>
+                  <div className="glass-panel rounded-xl p-4 flex items-center justify-between gap-3 border border-white/10">
+                    <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
+                      <Globe className="w-4 h-4 shrink-0" />
+                      <span>لينك الموقع (Live URL)</span>
+                    </span>
 
-                      <div className="flex items-center gap-2">
-                        {selectedProject.liveUrl && (
-                          <a
-                            href={ensureProtocol(selectedProject.liveUrl)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="p-1.5 rounded-lg bg-white/[0.04] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/40 text-slate-300 hover:text-sky-200 transition-colors"
-                            title="فتح الرابط في نافذة جديدة"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
+                    <div className="flex items-center gap-2">
+                      {/* Desktop Copy Button */}
+                      <button
+                        type="button"
+                        disabled={!selectedProject.liveUrl}
+                        onClick={() =>
+                          handleCopy(selectedProject.liveUrl, 'لينك الموقع', 'live')
+                        }
+                        className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        {copiedFieldKey === 'live' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-emerald-300">تم النسخ</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>نسخ</span>
+                          </>
                         )}
-                        <button
-                          type="button"
-                          disabled={!selectedProject.liveUrl}
-                          onClick={() =>
-                            handleCopy(selectedProject.liveUrl, 'لينك الموقع', 'live')
-                          }
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 disabled:pointer-events-none border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                          title="نسخ لينك الموقع"
-                        >
-                          {copiedFieldKey === 'live' ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span className="text-emerald-300">تم النسخ</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>نسخ</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                      </button>
+
+                      {/* الرابط عبارة عن زر "فتح المنصة" */}
+                      <a
+                        href={ensureProtocol(selectedProject.liveUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-2 px-3.5 rounded-xl text-xs font-medium text-slate-200 hover:text-sky-200 bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 transition-all flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                        <span>فتح المنصة</span>
+                        <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400" />
+                      </a>
                     </div>
-                    <p
-                      dir="ltr"
-                      className="text-xs sm:text-sm font-mono text-slate-200 break-all text-left bg-[#050914]/60 px-3.5 py-2.5 rounded-lg border border-white/5"
-                    >
-                      {selectedProject.liveUrl || 'لم يتم إدخال رابط الموقع'}
-                    </p>
                   </div>
 
                   {/* Field 3: لينك GitHub */}
-                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10 hover:border-sky-400/35 transition-colors">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
-                        <Github className="w-4 h-4" />
-                        <span>لينك GitHub</span>
-                      </span>
+                  <div className="glass-panel rounded-xl p-4 flex items-center justify-between gap-3 border border-white/10">
+                    <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
+                      <Github className="w-4 h-4 shrink-0" />
+                      <span>لينك GitHub</span>
+                    </span>
 
-                      <div className="flex items-center gap-2">
-                        {selectedProject.githubUrl && (
-                          <a
-                            href={ensureProtocol(selectedProject.githubUrl)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="p-1.5 rounded-lg bg-white/[0.04] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/40 text-slate-300 hover:text-sky-200 transition-colors"
-                            title="فتح مستودع GitHub"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={!selectedProject.githubUrl}
+                        onClick={() =>
+                          handleCopy(selectedProject.githubUrl, 'لينك GitHub', 'github')
+                        }
+                        className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        {copiedFieldKey === 'github' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-emerald-300">تم النسخ</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>نسخ</span>
+                          </>
                         )}
-                        <button
-                          type="button"
-                          disabled={!selectedProject.githubUrl}
-                          onClick={() =>
-                            handleCopy(selectedProject.githubUrl, 'لينك GitHub', 'github')
-                          }
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 disabled:pointer-events-none border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                          title="نسخ لينك GitHub"
-                        >
-                          {copiedFieldKey === 'github' ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span className="text-emerald-300">تم النسخ</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>نسخ</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                      </button>
+
+                      <a
+                        href={ensureProtocol(selectedProject.githubUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-2 px-3.5 rounded-xl text-xs font-medium text-slate-200 hover:text-sky-200 bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 transition-all flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                        <span>فتح المنصة</span>
+                        <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400" />
+                      </a>
                     </div>
-                    <p
-                      dir="ltr"
-                      className="text-xs sm:text-sm font-mono text-slate-200 break-all text-left bg-[#050914]/60 px-3.5 py-2.5 rounded-lg border border-white/5"
-                    >
-                      {selectedProject.githubUrl || 'لم يتم إدخال رابط GitHub'}
-                    </p>
                   </div>
 
                   {/* Field 4: لينك Vercel */}
-                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10 hover:border-sky-400/35 transition-colors">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
-                        <Triangle className="w-4 h-4" />
-                        <span>لينك Vercel</span>
-                      </span>
+                  <div className="glass-panel rounded-xl p-4 flex items-center justify-between gap-3 border border-white/10">
+                    <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
+                      <Triangle className="w-4 h-4 shrink-0" />
+                      <span>لينك Vercel</span>
+                    </span>
 
-                      <div className="flex items-center gap-2">
-                        {selectedProject.vercelUrl && (
-                          <a
-                            href={ensureProtocol(selectedProject.vercelUrl)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="p-1.5 rounded-lg bg-white/[0.04] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/40 text-slate-300 hover:text-sky-200 transition-colors"
-                            title="فتح رابط Vercel"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={!selectedProject.vercelUrl}
+                        onClick={() =>
+                          handleCopy(selectedProject.vercelUrl, 'لينك Vercel', 'vercel')
+                        }
+                        className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        {copiedFieldKey === 'vercel' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-emerald-300">تم النسخ</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>نسخ</span>
+                          </>
                         )}
-                        <button
-                          type="button"
-                          disabled={!selectedProject.vercelUrl}
-                          onClick={() =>
-                            handleCopy(selectedProject.vercelUrl, 'لينك Vercel', 'vercel')
-                          }
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 disabled:pointer-events-none border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                          title="نسخ لينك Vercel"
-                        >
-                          {copiedFieldKey === 'vercel' ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span className="text-emerald-300">تم النسخ</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>نسخ</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                      </button>
+
+                      <a
+                        href={ensureProtocol(selectedProject.vercelUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-2 px-3.5 rounded-xl text-xs font-medium text-slate-200 hover:text-sky-200 bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 transition-all flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                        <span>فتح المنصة</span>
+                        <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400" />
+                      </a>
                     </div>
-                    <p
-                      dir="ltr"
-                      className="text-xs sm:text-sm font-mono text-slate-200 break-all text-left bg-[#050914]/60 px-3.5 py-2.5 rounded-lg border border-white/5"
-                    >
-                      {selectedProject.vercelUrl || 'لم يتم إدخال رابط Vercel'}
-                    </p>
                   </div>
 
                   {/* Field 5: لينك فاير بيز السحابي */}
-                  <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10 hover:border-sky-400/35 transition-colors">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
-                        <Flame className="w-4 h-4 text-amber-400" />
-                        <span>لينك فاير بيز السحابي</span>
-                      </span>
+                  <div className="glass-panel rounded-xl p-4 flex items-center justify-between gap-3 border border-white/10">
+                    <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
+                      <Flame className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>لينك فاير بيز السحابي</span>
+                    </span>
 
-                      <div className="flex items-center gap-2">
-                        {selectedProject.firebaseUrl && (
-                          <a
-                            href={ensureProtocol(selectedProject.firebaseUrl)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="p-1.5 rounded-lg bg-white/[0.04] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/40 text-slate-300 hover:text-sky-200 transition-colors"
-                            title="فتح رابط فاير بيز السحابي"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={!selectedProject.firebaseUrl}
+                        onClick={() =>
+                          handleCopy(
+                            selectedProject.firebaseUrl || '',
+                            'لينك فاير بيز السحابي',
+                            'firebase'
+                          )
+                        }
+                        className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        {copiedFieldKey === 'firebase' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-emerald-300">تم النسخ</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>نسخ</span>
+                          </>
                         )}
-                        <button
-                          type="button"
-                          disabled={!selectedProject.firebaseUrl}
-                          onClick={() =>
-                            handleCopy(
-                              selectedProject.firebaseUrl || '',
-                              'لينك فاير بيز السحابي',
-                              'firebase'
-                            )
-                          }
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 disabled:opacity-40 disabled:pointer-events-none border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                          title="نسخ لينك فاير بيز السحابي"
-                        >
-                          {copiedFieldKey === 'firebase' ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span className="text-emerald-300">تم النسخ</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>نسخ</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                      </button>
+
+                      <a
+                        href={ensureProtocol(selectedProject.firebaseUrl || '')}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-2 px-3.5 rounded-xl text-xs font-medium text-slate-200 hover:text-sky-200 bg-white/[0.04] hover:bg-sky-500/15 border border-white/10 hover:border-sky-400/40 transition-all flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                        <span>فتح المنصة</span>
+                        <ArrowUpLeft className="w-3.5 h-3.5 text-slate-400" />
+                      </a>
                     </div>
-                    <p
-                      dir="ltr"
-                      className="text-xs sm:text-sm font-mono text-slate-200 break-all text-left bg-[#050914]/60 px-3.5 py-2.5 rounded-lg border border-white/5"
-                    >
-                      {selectedProject.firebaseUrl || 'لم يتم إدخال رابط فاير بيز السحابي'}
-                    </p>
                   </div>
                 </div>
               )}
 
               {/* Bottom Additional Link: رابط "Google Studio" (يظهر فقط عند تسجيل الدخول) */}
-              {isAuthenticated && (
-                <div className="mt-6 pt-5 border-t border-white/10 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+              {isAuthenticated && !isEditingInModal && (
+                <div className="mt-5 pt-4 border-t border-white/10 flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 text-xs text-slate-300">
                     <Link2 className="w-4 h-4 text-sky-400 shrink-0" />
-                    <span>الرابط الإضافي للمشروع على منصة التطوير:</span>
+                    <span>Google Studio</span>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -1569,8 +2129,7 @@ export default function App() {
                           'studio'
                         )
                       }
-                      className="px-3 py-2.5 rounded-xl text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                      title="نسخ لينك Google Studio"
+                      className="hidden sm:flex px-3 py-2 rounded-xl text-xs font-medium bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 hover:border-sky-400/50 text-slate-200 hover:text-sky-200 items-center gap-1.5 transition-all cursor-pointer"
                     >
                       {copiedFieldKey === 'studio' ? (
                         <>
@@ -1591,10 +2150,10 @@ export default function App() {
                       )}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="glow-button-primary px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white flex items-center justify-center gap-2 whitespace-nowrap"
+                      className="glow-button-primary px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center justify-center gap-2 whitespace-nowrap"
                     >
-                      <Sparkles className="w-4 h-4" />
-                      <span>Google Studio</span>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>فتح المنصة</span>
                       <ExternalLink className="w-3.5 h-3.5" />
                     </a>
                   </div>
@@ -1606,7 +2165,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* =====================================================================
-          SETTINGS MODAL (نافذة الإعدادات السرية بدون أي تلميح للباسورد)
+          SETTINGS MODAL (نافذة الإعدادات السرية + تعديل اسم الموقع وقائمة التواصل لحظياً)
       ====================================================================== */}
       <AnimatePresence>
         {isSettingsModalOpen && (
@@ -1628,7 +2187,7 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.95, y: 12 }}
               transition={{ duration: 0.18 }}
               onClick={(e) => e.stopPropagation()}
-              className="glass-modal relative w-full max-w-md rounded-2xl p-6 sm:p-7 text-right"
+              className="glass-modal relative w-full max-w-lg rounded-2xl p-6 sm:p-7 text-right max-h-[90vh] overflow-y-auto"
             >
               <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-5">
                 <div className="flex items-center gap-3">
@@ -1654,24 +2213,117 @@ export default function App() {
 
               {isAuthenticated ? (
                 <div className="space-y-5">
-                  <div className="glass-panel rounded-xl p-4 flex items-center gap-3 border border-emerald-400/30">
+                  <div className="glass-panel rounded-xl p-3.5 flex items-center gap-3 border border-emerald-400/30">
                     <Unlock className="w-5 h-5 text-emerald-400 shrink-0" />
-                    <p className="text-xs sm:text-sm text-slate-200">
-                      تم تفعيل وضع المطور وعرض كافة الروابط.
+                    <p className="text-xs text-slate-200">
+                      وضع المطور مفعل — أي تعديل أدناه يظهر ويتحدث لحظياً في الموقع.
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsAuthenticated(false);
-                      setIsSettingsModalOpen(false);
-                      showToast('تم قفل الروابط والعودة لوضع الزائر');
-                    }}
-                    className="w-full py-3 px-5 rounded-xl text-sm font-medium text-rose-200 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 transition-all cursor-pointer"
-                  >
-                    تسجيل الخروج وإخفاء الروابط
-                  </button>
+                  {/* 1. خانة تعديل اسم الموقع */}
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="setting-site-name"
+                      className="block text-xs font-semibold text-sky-300"
+                    >
+                      تعديل اسم الموقع
+                    </label>
+                    <input
+                      id="setting-site-name"
+                      type="text"
+                      value={siteConfig.siteName}
+                      onChange={(e) => handleUpdateSiteConfig('siteName', e.target.value)}
+                      placeholder="منصه مشروعات المطور Amir Lamay"
+                      className="glass-input w-full px-4 py-2.5 rounded-xl text-sm text-white"
+                    />
+                  </div>
+
+                  {/* 2. قائمة التواصل (فيس بوك، انستجرام، رقم الهاتف) */}
+                  <div className="space-y-3 pt-3 border-t border-white/10">
+                    <h4 className="text-xs font-bold text-sky-300">قائمة التواصل</h4>
+
+                    {/* لينك الفيس بوك */}
+                    <div className="space-y-1.5">
+                      <label
+                        htmlFor="setting-fb"
+                        className="block text-xs font-medium text-slate-300"
+                      >
+                        لينك الفيس بوك
+                      </label>
+                      <input
+                        id="setting-fb"
+                        type="text"
+                        dir="ltr"
+                        value={siteConfig.facebookUrl}
+                        onChange={(e) => handleUpdateSiteConfig('facebookUrl', e.target.value)}
+                        placeholder="https://www.facebook.com/username"
+                        className="glass-input w-full px-4 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-left"
+                      />
+                    </div>
+
+                    {/* لينك الانستجرام */}
+                    <div className="space-y-1.5">
+                      <label
+                        htmlFor="setting-ig"
+                        className="block text-xs font-medium text-slate-300"
+                      >
+                        لينك الانستجرام
+                      </label>
+                      <input
+                        id="setting-ig"
+                        type="text"
+                        dir="ltr"
+                        value={siteConfig.instagramUrl}
+                        onChange={(e) => handleUpdateSiteConfig('instagramUrl', e.target.value)}
+                        placeholder="https://www.instagram.com/username"
+                        className="glass-input w-full px-4 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-left"
+                      />
+                    </div>
+
+                    {/* رقم الهاتف (واتساب) */}
+                    <div className="space-y-1.5">
+                      <label
+                        htmlFor="setting-phone"
+                        className="block text-xs font-medium text-slate-300"
+                      >
+                        رقم الهاتف (واتساب)
+                      </label>
+                      <input
+                        id="setting-phone"
+                        type="text"
+                        dir="ltr"
+                        value={siteConfig.phoneNumber}
+                        onChange={(e) => handleUpdateSiteConfig('phoneNumber', e.target.value)}
+                        placeholder="201000000000"
+                        className="glass-input w-full px-4 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-left"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSettingsModalOpen(false);
+                        showToast('تم حفظ الإعدادات وتحديث الموقع لحظياً');
+                      }}
+                      className="glow-button-primary w-full py-2.5 px-5 rounded-xl text-xs sm:text-sm font-semibold text-white cursor-pointer"
+                    >
+                      تم
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAuthenticated(false);
+                        setIsSettingsModalOpen(false);
+                        showToast('تم قفل الروابط والعودة لوضع الزائر');
+                      }}
+                      className="w-full py-2.5 px-5 rounded-xl text-xs sm:text-sm font-medium text-rose-200 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 transition-all cursor-pointer"
+                    >
+                      تسجيل الخروج وإخفاء الروابط
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <form onSubmit={handlePasswordSubmit} className="space-y-4" autoComplete="off">
@@ -1682,7 +2334,10 @@ export default function App() {
                   )}
 
                   <div className="space-y-2">
-                    <label htmlFor="secret-pass-input" className="block text-xs font-medium text-slate-300">
+                    <label
+                      htmlFor="secret-pass-input"
+                      className="block text-xs font-medium text-slate-300"
+                    >
                       الرمز السري
                     </label>
                     <input
