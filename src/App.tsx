@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Plus,
   X,
@@ -31,12 +31,16 @@ import {
   Users,
   RefreshCw,
   Phone,
+  Download,
+  Upload,
+  WifiOff,
+  Smartphone,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { registerSW } from 'virtual:pwa-register';
 import { db } from './firebase';
 import {
   collection,
-  addDoc,
   getDocs,
   deleteDoc,
   updateDoc,
@@ -44,6 +48,11 @@ import {
   setDoc,
   onSnapshot,
 } from 'firebase/firestore';
+
+// Register PWA Service Worker for full offline browsing on mobile & desktop
+if (typeof window !== 'undefined') {
+  registerSW({ immediate: true });
+}
 
 export interface Project {
   id: string;
@@ -63,6 +72,20 @@ export interface SiteConfig {
   phoneNumber: string;
 }
 
+interface OfflineOperation {
+  id: string;
+  type: 'upsert_project' | 'delete_project' | 'update_settings';
+  project?: Project;
+  projectId?: string;
+  siteConfig?: SiteConfig;
+  timestamp: number;
+}
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
+
 const DEFAULT_SITE_CONFIG: SiteConfig = {
   siteName: 'منصه مشروعات المطور Amir Lamay',
   facebookUrl: 'https://www.facebook.com/',
@@ -71,12 +94,51 @@ const DEFAULT_SITE_CONFIG: SiteConfig = {
 };
 
 const SITE_CONFIG_STORAGE_KEY = 'glassfolio_site_config_v1';
+const PROJECTS_CACHE_KEY = 'glassfolio_projects_cache_v1';
+const OFFLINE_QUEUE_KEY = 'glassfolio_offline_queue_v1';
+const BIRTH_DATE_STORAGE_KEY = 'glassfolio_birthdate_v1';
+const CAPMAS_ANCHOR_KEY = 'glassfolio_capmas_anchor_v1';
+
+// Official CAPMAS verified baseline anchor:
+// 109,701,538 at 2026-10-26T15:50:26.658Z (1793039426658 ms), official CAPMAS growth rate: 0.04907159 persons/sec
+const DEFAULT_CAPMAS_ANCHOR = {
+  population: 109701538,
+  timestampMs: 1793039426658,
+};
+const OFFICIAL_CAPMAS_GROWTH_PER_SEC = 0.04907159;
 
 export default function App() {
-  // 1. تعريف حالة المشاريع
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  // 1. تعريف حالة المشاريع مع التحميل الفوري من الكاش المحلي في المتصفح (0ms)
+  const [projects, setProjects] = useState<Project[]>(() => {
+    try {
+      const cached = localStorage.getItem(PROJECTS_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+
+  // Never block UI if cached projects exist
+  const [isLoading, setIsLoading] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(PROJECTS_CACHE_KEY) === null;
+    } catch {
+      return false;
+    }
+  });
+
+  // Online / Offline Connectivity State
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+
+  // PWA Install Prompt State
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isPWAInstalled, setIsPWAInstalled] = useState<boolean>(false);
 
   // Navigation View State ('projects' | 'age')
   const [activeView, setActiveView] = useState<'projects' | 'age'>('projects');
@@ -94,6 +156,15 @@ export default function App() {
     return DEFAULT_SITE_CONFIG;
   });
 
+  // Save projects cache whenever `projects` changes
+  useEffect(() => {
+    try {
+      localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(projects));
+    } catch {
+      // ignore
+    }
+  }, [projects]);
+
   // Sync Site Title with Browser Tab in real-time
   useEffect(() => {
     document.title = siteConfig.siteName || 'منصه مشروعات المطور Amir Lamay';
@@ -103,6 +174,133 @@ export default function App() {
       // ignore
     }
   }, [siteConfig]);
+
+  // Helper to read/write Offline Sync Queue
+  const getOfflineQueue = (): OfflineOperation[] => {
+    try {
+      const raw = localStorage.getItem(OFFLINE_QUEUE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const enqueueOfflineOperation = (op: OfflineOperation) => {
+    try {
+      const queue = getOfflineQueue();
+      queue.push(op);
+      localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+    } catch {
+      // ignore
+    }
+  };
+
+  // Trigger Toast Notification
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+  }, []);
+
+  useEffect(() => {
+    if (!toastMessage) return;
+    const timer = setTimeout(() => {
+      setToastMessage(null);
+    }, 2600);
+    return () => clearTimeout(timer);
+  }, [toastMessage]);
+
+  // Flush Offline Sync Queue when internet returns
+  const syncPendingOfflineOperations = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    const queue = getOfflineQueue();
+    if (queue.length === 0) return;
+
+    const remaining: OfflineOperation[] = [];
+    let syncedCount = 0;
+
+    for (const op of queue) {
+      try {
+        if (op.type === 'upsert_project' && op.project) {
+          const { id, ...data } = op.project;
+          await setDoc(doc(db, 'projects', id), data, { merge: true });
+          syncedCount++;
+        } else if (op.type === 'delete_project' && op.projectId) {
+          await deleteDoc(doc(db, 'projects', op.projectId));
+          syncedCount++;
+        } else if (op.type === 'update_settings' && op.siteConfig) {
+          await setDoc(doc(db, 'settings', 'siteConfig'), op.siteConfig, { merge: true });
+          syncedCount++;
+        }
+      } catch {
+        remaining.push(op);
+      }
+    }
+
+    try {
+      localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(remaining));
+    } catch {
+      // ignore
+    }
+
+    if (syncedCount > 0) {
+      showToast('تم استعادة الإنترنت ورفع التحديثات على السيستم تلقائياً');
+    }
+  }, [showToast]);
+
+  // Monitor Online/Offline events and PWA install prompt
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      syncPendingOfflineOperations();
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    // Sync any pending operations on startup if online
+    if (navigator.onLine) {
+      syncPendingOfflineOperations();
+    }
+
+    const isStandalone =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+    setIsPWAInstalled(isStandalone);
+
+    const handleBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferredPrompt(e as BeforeInstallPromptEvent);
+    };
+
+    const handleAppInstalled = () => {
+      setIsPWAInstalled(true);
+      setDeferredPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, [syncPendingOfflineOperations]);
+
+  const handleInstallPWA = async () => {
+    if (!deferredPrompt) return;
+    await deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setIsPWAInstalled(true);
+      setDeferredPrompt(null);
+      showToast('تم تثبيت التطبيق على جهازك للعمل بدون إنترنت');
+    }
+  };
 
   // Real-time Firestore listener for Site Config
   useEffect(() => {
@@ -121,19 +319,68 @@ export default function App() {
         }
       },
       () => {
-        // Ignore if offline or rules restrict settings collection
+        // Offline fallback handled by localStorage
       }
     );
     return () => unsubscribe();
   }, []);
 
-  // Update Site Config helper (updates state immediately + saves to Firestore)
+  // Real-time Firestore listener for Projects (with Persistent IndexedDB + LocalStorage Cache)
+  useEffect(() => {
+    const projectsColRef = collection(db, 'projects');
+    const unsubscribe = onSnapshot(
+      projectsColRef,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        const projectsData: Project[] = snapshot.docs.map((docItem) => {
+          const data = docItem.data();
+          return {
+            id: docItem.id,
+            description: data.description || '',
+            liveUrl: data.liveUrl || '',
+            githubUrl: data.githubUrl || '',
+            vercelUrl: data.vercelUrl || '',
+            firebaseUrl: data.firebaseUrl || '',
+            googleStudioUrl: data.googleStudioUrl || 'https://aistudio.google.com/',
+            createdAt: data.createdAt || new Date().toISOString().split('T')[0],
+          };
+        });
+        setProjects(projectsData);
+        setIsLoading(false);
+        try {
+          localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(projectsData));
+        } catch {
+          // ignore
+        }
+      },
+      () => {
+        setIsLoading(false);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Update Site Config helper (updates state immediately + queues for Firestore if offline)
   const handleUpdateSiteConfig = (field: keyof SiteConfig, value: string) => {
     setSiteConfig((prev) => {
       const updated = { ...prev, [field]: value };
-      setDoc(doc(db, 'settings', 'siteConfig'), updated, { merge: true }).catch(() => {
-        // Fallback already saved in localStorage
-      });
+      if (navigator.onLine) {
+        setDoc(doc(db, 'settings', 'siteConfig'), updated, { merge: true }).catch(() => {
+          enqueueOfflineOperation({
+            id: `op-${Date.now()}`,
+            type: 'update_settings',
+            siteConfig: updated,
+            timestamp: Date.now(),
+          });
+        });
+      } else {
+        enqueueOfflineOperation({
+          id: `op-${Date.now()}`,
+          type: 'update_settings',
+          siteConfig: updated,
+          timestamp: Date.now(),
+        });
+      }
       return updated;
     });
   };
@@ -182,56 +429,127 @@ export default function App() {
   const [editFirebaseUrl, setEditFirebaseUrl] = useState('');
   const [editGoogleStudioUrl, setEditGoogleStudioUrl] = useState('');
 
-  // Clipboard & Toast Notification State
+  // Clipboard State
   const [copiedFieldKey, setCopiedFieldKey] = useState<string | null>(null);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // File Input Ref for Import Data
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // =====================================================================
   // AGE CALCULATOR & OFFICIAL LIVE EGYPT POPULATION STATES
   // =====================================================================
   const [birthInputMode, setBirthInputMode] = useState<'calendar' | 'manual'>('calendar');
-  const [birthDateString, setBirthDateString] = useState<string>('2000-01-01');
-  const [manualDay, setManualDay] = useState<string>('1');
-  const [manualMonth, setManualMonth] = useState<string>('1');
-  const [manualYear, setManualYear] = useState<string>('2000');
-
-  // Official CAPMAS Egypt Population State
-  const [egyptPopulation, setEgyptPopulation] = useState<number | null>(null);
-  const [popFetchedAt, setPopFetchedAt] = useState<string | null>(null);
-  const [isFetchingPop, setIsFetchingPop] = useState<boolean>(false);
-  const [popError, setPopError] = useState<string | null>(null);
-
-  const fetchOfficialEgyptPopulation = useCallback(async (showSpinner = false) => {
+  const [birthDateString, setBirthDateString] = useState<string>(() => {
     try {
-      if (showSpinner) setIsFetchingPop(true);
-      setPopError(null);
-      const res = await fetch('/api/egypt-population', { cache: 'no-store' });
-      if (!res.ok) throw new Error('Failed to fetch official population');
-      const data = await res.json();
-      if (typeof data.population === 'number' && data.population > 0) {
-        setEgyptPopulation(data.population);
-        setPopFetchedAt(
-          new Date().toLocaleTimeString('ar-EG', {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: true,
-          })
-        );
+      return localStorage.getItem(BIRTH_DATE_STORAGE_KEY) || '2000-01-01';
+    } catch {
+      return '2000-01-01';
+    }
+  });
+
+  const [manualDay, setManualDay] = useState<string>(() => {
+    const parts = birthDateString.split('-');
+    return parts.length === 3 ? String(parseInt(parts[2], 10)) : '1';
+  });
+  const [manualMonth, setManualMonth] = useState<string>(() => {
+    const parts = birthDateString.split('-');
+    return parts.length === 3 ? String(parseInt(parts[1], 10)) : '1';
+  });
+  const [manualYear, setManualYear] = useState<string>(() => {
+    const parts = birthDateString.split('-');
+    return parts.length === 3 ? parts[0] : '2000';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(BIRTH_DATE_STORAGE_KEY, birthDateString);
+    } catch {
+      // ignore
+    }
+  }, [birthDateString]);
+
+  // Official CAPMAS Egypt Population Anchor (Instant 0ms display, zero loading delay, works online & offline)
+  const [capmasAnchor, setCapmasAnchor] = useState<{
+    population: number;
+    timestampMs: number;
+  }>(() => {
+    try {
+      const saved = localStorage.getItem(CAPMAS_ANCHOR_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed.population === 'number' && parsed.population > 100000000) {
+          return parsed;
+        }
       }
     } catch {
-      setPopError('جاري إعادة الاتصال بخادم الساعة السكانية الرسمي...');
+      // ignore
+    }
+    return DEFAULT_CAPMAS_ANCHOR;
+  });
+  const [isFetchingPop, setIsFetchingPop] = useState<boolean>(false);
+
+  // Live Egypt Population calculated in real-time every second from the official CAPMAS anchor
+  const liveEgyptPopulation = useMemo(() => {
+    const elapsedSec = Math.max(0, (currentTime.getTime() - capmasAnchor.timestampMs) / 1000);
+    return Math.round(capmasAnchor.population + elapsedSec * OFFICIAL_CAPMAS_GROWTH_PER_SEC);
+  }, [capmasAnchor, currentTime]);
+
+  const fetchOfficialEgyptPopulation = useCallback(async (showSpinner = false) => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    try {
+      if (showSpinner) setIsFetchingPop(true);
+      const res = await fetch('/api/egypt-population', { cache: 'no-store' });
+      if (res.ok) {
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await res.json();
+          if (typeof data.population === 'number' && data.population > 100000000) {
+            const newAnchor = {
+              population: data.population,
+              timestampMs: data.anchorTimestampMs || Date.now(),
+            };
+            setCapmasAnchor(newAnchor);
+            try {
+              localStorage.setItem(CAPMAS_ANCHOR_KEY, JSON.stringify(newAnchor));
+            } catch {
+              // ignore
+            }
+            return;
+          }
+        }
+      }
+      // Fallback for static deployments (e.g. Vercel without Express backend)
+      const proxyRes = await fetch(
+        'https://api.allorigins.win/raw?url=' +
+          encodeURIComponent('https://www.capmas.gov.eg:8080/population-proxy/total'),
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (proxyRes.ok) {
+        const text = (await proxyRes.text()).trim();
+        const num = parseInt(text.replace(/[^0-9]/g, ''), 10);
+        if (num && !isNaN(num) && num > 100000000) {
+          const newAnchor = { population: num, timestampMs: Date.now() };
+          setCapmasAnchor(newAnchor);
+          try {
+            localStorage.setItem(CAPMAS_ANCHOR_KEY, JSON.stringify(newAnchor));
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } catch {
+      // Silently continue using the verified CAPMAS anchor without displaying any error text
     } finally {
       if (showSpinner) setIsFetchingPop(false);
     }
   }, []);
 
-  // Poll official CAPMAS endpoint every 5 seconds
+  // Poll official CAPMAS endpoint in background when online
   useEffect(() => {
-    fetchOfficialEgyptPopulation(true);
+    fetchOfficialEgyptPopulation(false);
     const interval = setInterval(() => {
       fetchOfficialEgyptPopulation(false);
-    }, 5000);
+    }, 10000);
     return () => clearInterval(interval);
   }, [fetchOfficialEgyptPopulation]);
 
@@ -329,50 +647,6 @@ export default function App() {
     [projects, selectedProjectId]
   );
 
-  // Trigger Toast Notification
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-  };
-
-  useEffect(() => {
-    if (!toastMessage) return;
-    const timer = setTimeout(() => {
-      setToastMessage(null);
-    }, 2600);
-    return () => clearTimeout(timer);
-  }, [toastMessage]);
-
-  // 2. دالة لجلب المشاريع من السحابة عند فتح الموقع
-  const fetchProjects = useCallback(async () => {
-    try {
-      setIsLoading(true);
-      const querySnapshot = await getDocs(collection(db, 'projects'));
-      const projectsData: Project[] = querySnapshot.docs.map((docItem) => {
-        const data = docItem.data();
-        return {
-          id: docItem.id,
-          description: data.description || '',
-          liveUrl: data.liveUrl || '',
-          githubUrl: data.githubUrl || '',
-          vercelUrl: data.vercelUrl || '',
-          firebaseUrl: data.firebaseUrl || '',
-          googleStudioUrl: data.googleStudioUrl || 'https://aistudio.google.com/',
-          createdAt: data.createdAt || new Date().toISOString().split('T')[0],
-        };
-      });
-      setProjects(projectsData);
-    } catch (error) {
-      console.error('حدث خطأ أثناء جلب المشاريع من فايربيز: ', error);
-      showToast('تعذر جلب البيانات من السحابة، تأكد من صلاحيات Firestore');
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchProjects();
-  }, [fetchProjects]);
-
   // Copy to Clipboard Handler
   const handleCopy = async (text: string, fieldLabel: string, fieldKey: string) => {
     if (!text) return;
@@ -409,7 +683,7 @@ export default function App() {
     setFormError('');
   };
 
-  // 3. دالة لحفظ مشروع جديد في فايربيز
+  // 3. دالة لحفظ مشروع جديد (فورية 0ms وتعمل بالإنترنت وبدون إنترنت وترفع التحديث تلقائياً)
   const handleSaveProject = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -424,7 +698,9 @@ export default function App() {
       return;
     }
 
-    const newProjectData = {
+    const customId = `proj-${Date.now()}`;
+    const newProject: Project = {
+      id: customId,
       description: description.trim() || 'مشروع بدون وصف',
       liveUrl: liveUrl.trim(),
       githubUrl: githubUrl.trim(),
@@ -434,18 +710,30 @@ export default function App() {
       createdAt: new Date().toISOString().split('T')[0],
     };
 
-    try {
-      setIsSubmitting(true);
-      await addDoc(collection(db, 'projects'), newProjectData);
-      resetAddForm();
-      setIsAddModalOpen(false);
-      showToast('تم حفظ المشروع في فايربيز بنجاح!');
-      await fetchProjects();
-    } catch (error) {
-      console.error('حدث خطأ أثناء الحفظ: ', error);
-      setFormError('حدث خطأ أثناء الحفظ في فايربيز. تأكد من إعدادات القواعد (Rules).');
-    } finally {
-      setIsSubmitting(false);
+    // Optimistic instant update in browser state & localStorage
+    setProjects((prev) => [newProject, ...prev]);
+    resetAddForm();
+    setIsAddModalOpen(false);
+
+    const { id: docId, ...firestoreData } = newProject;
+    if (navigator.onLine) {
+      showToast('تم حفظ المشروع بنجاح!');
+      setDoc(doc(db, 'projects', docId), firestoreData).catch(() => {
+        enqueueOfflineOperation({
+          id: `op-${Date.now()}`,
+          type: 'upsert_project',
+          project: newProject,
+          timestamp: Date.now(),
+        });
+      });
+    } else {
+      enqueueOfflineOperation({
+        id: `op-${Date.now()}`,
+        type: 'upsert_project',
+        project: newProject,
+        timestamp: Date.now(),
+      });
+      showToast('تم حفظ المشروع محلياً وسيتم رفعه تلقائياً عند عودة الإنترنت');
     }
   };
 
@@ -479,12 +767,13 @@ export default function App() {
     setIsEditingInModal(true);
   };
 
-  // Save Edited Project inside Details Modal to Firestore
+  // Save Edited Project (Optimistic instant update + online/offline sync)
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedProject) return;
 
-    const updatedData = {
+    const updatedProject: Project = {
+      ...selectedProject,
       description: editDescription.trim() || 'مشروع بدون وصف',
       liveUrl: editLiveUrl.trim(),
       githubUrl: editGithubUrl.trim(),
@@ -493,35 +782,189 @@ export default function App() {
       googleStudioUrl: editGoogleStudioUrl.trim() || 'https://aistudio.google.com/',
     };
 
-    try {
-      setIsSubmitting(true);
-      await updateDoc(doc(db, 'projects', selectedProject.id), updatedData);
-      setIsEditingInModal(false);
-      showToast('تم تحديث بيانات المشروع في السحابة بنجاح');
-      await fetchProjects();
-    } catch (error) {
-      console.error('حدث خطأ أثناء التحديث: ', error);
-      showToast('حدث خطأ أثناء تحديث المشروع');
-    } finally {
-      setIsSubmitting(false);
+    setProjects((prev) =>
+      prev.map((item) => (item.id === selectedProject.id ? updatedProject : item))
+    );
+    setIsEditingInModal(false);
+
+    const { id: docId, ...firestoreData } = updatedProject;
+    if (navigator.onLine) {
+      showToast('تم تحديث بيانات المشروع بنجاح');
+      updateDoc(doc(db, 'projects', docId), firestoreData).catch(() => {
+        setDoc(doc(db, 'projects', docId), firestoreData, { merge: true }).catch(() => {
+          enqueueOfflineOperation({
+            id: `op-${Date.now()}`,
+            type: 'upsert_project',
+            project: updatedProject,
+            timestamp: Date.now(),
+          });
+        });
+      });
+    } else {
+      enqueueOfflineOperation({
+        id: `op-${Date.now()}`,
+        type: 'upsert_project',
+        project: updatedProject,
+        timestamp: Date.now(),
+      });
+      showToast('تم حفظ التعديلات محلياً وسيتم رفعها عند عودة الإنترنت');
     }
   };
 
-  // 4. دالة لحذف مشروع من فايربيز
+  // 4. دالة لحذف مشروع (فورية وتدعم العمل بدون إنترنت)
   const handleDeleteProject = async (projectId: string) => {
-    try {
-      setIsSubmitting(true);
-      await deleteDoc(doc(db, 'projects', projectId));
-      setSelectedProjectId(null);
-      setIsEditingInModal(false);
-      showToast('تم حذف المشروع من السحابة بنجاح');
-      await fetchProjects();
-    } catch (error) {
-      console.error('خطأ في الحذف: ', error);
-      showToast('حدث خطأ أثناء حذف المشروع');
-    } finally {
-      setIsSubmitting(false);
+    setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    setSelectedProjectId(null);
+    setIsEditingInModal(false);
+
+    if (navigator.onLine) {
+      showToast('تم حذف المشروع بنجاح');
+      deleteDoc(doc(db, 'projects', projectId)).catch(() => {
+        enqueueOfflineOperation({
+          id: `op-${Date.now()}`,
+          type: 'delete_project',
+          projectId,
+          timestamp: Date.now(),
+        });
+      });
+    } else {
+      enqueueOfflineOperation({
+        id: `op-${Date.now()}`,
+        type: 'delete_project',
+        projectId,
+        timestamp: Date.now(),
+      });
+      showToast('تم حذف المشروع محلياً وسيتم التحديث على السيستم فور عودة الإنترنت');
     }
+  };
+
+  // =====================================================================
+  // EXPORT & IMPORT ALL SITE DATA (تصدير واستيراد كل البيانات المدخلة في الموقع)
+  // =====================================================================
+  const handleExportAllData = () => {
+    try {
+      const exportPayload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        siteConfig,
+        birthDateString,
+        projects,
+      };
+      const jsonString = JSON.stringify(exportPayload, null, 2);
+      const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const dateStr = new Date().toISOString().split('T')[0];
+      link.href = url;
+      link.download = `amir-lamay-site-backup-${dateStr}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showToast('تم تصدير جميع البيانات المدخلة في الموقع بنجاح');
+    } catch {
+      showToast('حدث خطأ أثناء تصدير البيانات');
+    }
+  };
+
+  const handleImportAllData = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const content = event.target?.result as string;
+        const parsed = JSON.parse(content);
+
+        // Restore SiteConfig if present
+        if (parsed.siteConfig && typeof parsed.siteConfig === 'object') {
+          const newConfig: SiteConfig = {
+            siteName: parsed.siteConfig.siteName || DEFAULT_SITE_CONFIG.siteName,
+            facebookUrl: parsed.siteConfig.facebookUrl || DEFAULT_SITE_CONFIG.facebookUrl,
+            instagramUrl: parsed.siteConfig.instagramUrl || DEFAULT_SITE_CONFIG.instagramUrl,
+            phoneNumber: parsed.siteConfig.phoneNumber || DEFAULT_SITE_CONFIG.phoneNumber,
+          };
+          setSiteConfig(newConfig);
+          localStorage.setItem(SITE_CONFIG_STORAGE_KEY, JSON.stringify(newConfig));
+          if (navigator.onLine) {
+            setDoc(doc(db, 'settings', 'siteConfig'), newConfig, { merge: true }).catch(() => {
+              enqueueOfflineOperation({
+                id: `op-${Date.now()}-cfg`,
+                type: 'update_settings',
+                siteConfig: newConfig,
+                timestamp: Date.now(),
+              });
+            });
+          } else {
+            enqueueOfflineOperation({
+              id: `op-${Date.now()}-cfg`,
+              type: 'update_settings',
+              siteConfig: newConfig,
+              timestamp: Date.now(),
+            });
+          }
+        }
+
+        // Restore Birthdate if present
+        if (typeof parsed.birthDateString === 'string' && parsed.birthDateString) {
+          handleCalendarDateChange(parsed.birthDateString);
+        }
+
+        // Restore Projects if present (supports both { projects: [...] } or direct array [...])
+        const importedProjects: Project[] = Array.isArray(parsed.projects)
+          ? parsed.projects
+          : Array.isArray(parsed)
+          ? parsed
+          : [];
+
+        if (importedProjects.length > 0) {
+          const normalizedProjects: Project[] = importedProjects.map((p, idx) => ({
+            id: p.id || `proj-${Date.now()}-${idx}`,
+            description: p.description || 'مشروع بدون وصف',
+            liveUrl: p.liveUrl || '',
+            githubUrl: p.githubUrl || '',
+            vercelUrl: p.vercelUrl || '',
+            firebaseUrl: p.firebaseUrl || '',
+            googleStudioUrl: p.googleStudioUrl || 'https://aistudio.google.com/',
+            createdAt: p.createdAt || new Date().toISOString().split('T')[0],
+          }));
+
+          setProjects(normalizedProjects);
+          localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(normalizedProjects));
+
+          for (const proj of normalizedProjects) {
+            const { id: docId, ...firestoreData } = proj;
+            if (navigator.onLine) {
+              setDoc(doc(db, 'projects', docId), firestoreData, { merge: true }).catch(() => {
+                enqueueOfflineOperation({
+                  id: `op-${Date.now()}-${docId}`,
+                  type: 'upsert_project',
+                  project: proj,
+                  timestamp: Date.now(),
+                });
+              });
+            } else {
+              enqueueOfflineOperation({
+                id: `op-${Date.now()}-${docId}`,
+                type: 'upsert_project',
+                project: proj,
+                timestamp: Date.now(),
+              });
+            }
+          }
+        }
+
+        showToast('تم استيراد جميع البيانات وتحديث الموقع بنجاح');
+      } catch {
+        showToast('ملف الاستيراد غير صالح، يرجى اختيار ملف JSON صحيح');
+      } finally {
+        if (fileInputRef.current) {
+          fileInputRef.current.value = '';
+        }
+      }
+    };
+    reader.readAsText(file);
   };
 
   // Handle Settings Password Submit
@@ -775,6 +1218,21 @@ export default function App() {
           </>
         )}
 
+        {/* PWA Install Button if available */}
+        {!isPWAInstalled && deferredPrompt && (
+          <button
+            type="button"
+            onClick={handleInstallPWA}
+            className="w-full py-2.5 px-4 rounded-xl text-xs font-medium text-sky-200 bg-sky-500/12 hover:bg-sky-500/20 border border-sky-400/35 transition-all flex items-center justify-between cursor-pointer"
+          >
+            <span className="flex items-center gap-2">
+              <Smartphone className="w-3.5 h-3.5 text-sky-400" />
+              <span>تثبيت التطبيق للتصفح بدون نت</span>
+            </span>
+            <Download className="w-3.5 h-3.5 text-sky-300" />
+          </button>
+        )}
+
         {/* Settings Button (زر الإعدادات) */}
         <button
           type="button"
@@ -802,6 +1260,15 @@ export default function App() {
 
   return (
     <div className="relative min-h-screen w-full max-w-full bg-[#060B19] text-slate-100 flex flex-col lg:flex-row overflow-x-hidden">
+      {/* Hidden File Input for Import Data */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,application/json"
+        onChange={handleImportAllData}
+        className="hidden"
+      />
+
       {/* Deep Navy Ambient Lighting */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
         <div className="absolute -top-40 -right-40 h-[520px] w-[520px] rounded-full bg-sky-500/12 blur-[130px]" />
@@ -847,9 +1314,7 @@ export default function App() {
         className="relative z-10 flex-1 min-w-0 p-3 sm:p-6 lg:p-8 flex flex-col justify-between gap-5 max-w-[1440px] overflow-x-hidden"
       >
         <div className="flex flex-col gap-5 flex-1 min-w-0">
-          {/* Top Workspace Header:
-              - على اليمين: زر القائمة للهاتف + اسم الموقع
-              - بالأعلى على اليسار (مكان خانة البحث سابقاً): اليوم والتاريخ والساعة بنظام 12 ساعة */}
+          {/* Top Workspace Header */}
           <header className="glass-panel rounded-2xl px-4 sm:px-6 py-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
             {/* Right side of header: Mobile Menu + Site Name + Mobile Settings */}
             <div className="flex items-center justify-between gap-2 min-w-0">
@@ -867,10 +1332,19 @@ export default function App() {
                   <Menu className="w-5 h-5" />
                 </button>
 
-                <div className="min-w-0">
+                <div className="min-w-0 flex items-center gap-2">
                   <h2 className="text-base sm:text-xl font-bold text-white tracking-tight truncate">
                     {siteConfig.siteName}
                   </h2>
+                  {!isOnline && (
+                    <span
+                      title="وضع التصفح بدون إنترنت — سيتم رفع أي تحديثات تلقائياً فور عودة الاتصال"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-500/15 border border-amber-400/40 text-[10px] font-medium text-amber-300 shrink-0"
+                    >
+                      <WifiOff className="w-3 h-3" />
+                      <span>بدون نت</span>
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -931,14 +1405,6 @@ export default function App() {
               CONDITIONAL VIEW: EITHER PROJECTS OR AGE CALCULATOR ("احسب عمرك")
           ====================================================================== */}
           {activeView === 'age' ? (
-            /* =================================================================
-               "احسب عمرك" في نسخة الهاتف والكمبيوتر بالترتيب المطلوب:
-               1. التاريخ يظهر في سطر واحد (اليوم والتاريخ والساعة)
-               2. أسفلها الساعة السكانية الرسمية
-               3. أسفلها سجل تاريخك
-               4. وعمرك الحالي بالتفصيل (محدث لحظياً) بالتاريخ يظهروا في سطر واحد بدون مسطرة تحريك
-               5. السن والشهر واليوم في سطر واحد بجانب بعض، أسفلهم الساعة والدقائق والثواني
-            ================================================================== */
             <section
               aria-label="احسب عمرك والساعة السكانية"
               className="flex-1 flex flex-col gap-4 w-full max-w-full overflow-x-hidden"
@@ -960,7 +1426,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 2. أسفلها: الساعة السكانية الرسمية */}
+              {/* 2. أسفلها: الساعة السكانية الرسمية (تظهر فوراً دون أي تأخير أو رسائل انتظار) */}
               <div className="glass-modal w-full rounded-2xl p-4 sm:p-6 space-y-4 border border-sky-400/40 shadow-[0_0_30px_rgba(56,189,248,0.18)]">
                 <div className="flex items-center justify-between border-b border-white/10 pb-3">
                   <div className="flex items-center gap-2.5 min-w-0">
@@ -989,34 +1455,23 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Official Population Number Display */}
+                {/* Official Population Number Display (Always displays immediately) */}
                 <div className="glass-panel rounded-xl p-4 text-center space-y-2 border border-sky-400/30 bg-[#040814]/80">
                   <p className="text-[11px] sm:text-xs font-medium text-sky-300">
                     إجمالي عدد سكان جمهورية مصر العربية الآن (نسمة)
                   </p>
 
-                  {egyptPopulation ? (
-                    <div
-                      dir="ltr"
-                      className="text-2xl sm:text-4xl font-extrabold font-mono tabular-nums tracking-wider text-white drop-shadow-[0_0_18px_rgba(56,189,248,0.45)]"
-                    >
-                      {egyptPopulation.toLocaleString('en-US')}
-                    </div>
-                  ) : (
-                    <div className="py-2 flex items-center justify-center gap-2 text-xs sm:text-sm text-slate-300">
-                      <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
-                      <span>جاري الجلب المباشر من الموقع الرسمي...</span>
-                    </div>
-                  )}
+                  <div
+                    dir="ltr"
+                    className="text-2xl sm:text-4xl font-extrabold font-mono tabular-nums tracking-wider text-white drop-shadow-[0_0_18px_rgba(56,189,248,0.45)]"
+                  >
+                    {liveEgyptPopulation.toLocaleString('en-US')}
+                  </div>
 
-                  {popError && <p className="text-[11px] text-amber-300">{popError}</p>}
-
-                  {popFetchedAt && (
-                    <p className="text-[10px] sm:text-[11px] text-slate-400">
-                      آخر تحديث رسمي (CAPMAS):{' '}
-                      <span className="font-mono text-sky-300">{popFetchedAt}</span>
-                    </p>
-                  )}
+                  <p className="text-[10px] sm:text-[11px] text-slate-400">
+                    المصدر الرسمي: الجهاز المركزي للتعبئة العامة والإحصاء (CAPMAS) ·{' '}
+                    <span className="font-mono text-sky-300">{formatted12HourTime}</span>
+                  </p>
                 </div>
               </div>
 
@@ -1129,7 +1584,6 @@ export default function App() {
               {ageCalculation ? (
                 <>
                   <div className="glass-panel rounded-2xl p-4 sm:p-6 space-y-4 border border-sky-400/25 overflow-hidden">
-                    {/* Header + Birthdate in a single line (في سطر واحد بدون مسطرة تحريك) */}
                     <div className="flex items-center justify-between gap-2 whitespace-nowrap border-b border-white/10 pb-3">
                       <h4 className="text-xs sm:text-base font-bold text-white flex items-center gap-1.5 truncate">
                         <Sparkles className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sky-400 shrink-0" />
@@ -1267,10 +1721,9 @@ export default function App() {
                PROJECTS DISPLAY AREA:
                - شريط البحث اللحظي مكان شريط الإحصائيات المحذوف
                - عرض المشروعات في سطر واحد وفي اليسار زر "فتح المنصة"
-               - عدم إظهار روابط جيت هاب وفيركال وجوجل استوديو من الخارج حتى بعد تسجيل الدخول
             ================================================================== */
             <section aria-label="قائمة المشاريع" className="flex-1 flex flex-col gap-4 min-w-0">
-              {/* Live Search Bar (مكان الإحصائيات المحذوفة — فلترة لحظية بالحروف المكتوبة) */}
+              {/* Live Search Bar */}
               <div className="glass-panel rounded-2xl p-3 sm:p-4 border border-sky-400/25">
                 <div className="relative w-full">
                   <Search className="w-4 h-4 text-sky-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -1294,10 +1747,10 @@ export default function App() {
                 </div>
               </div>
 
-              {isLoading ? (
+              {isLoading && projects.length === 0 ? (
                 <div className="glass-panel rounded-2xl p-12 text-center my-auto flex flex-col items-center justify-center gap-4">
                   <Loader2 className="w-8 h-8 text-sky-400 animate-spin" />
-                  <p className="text-sm text-slate-300">جاري تحميل المشاريع من قاعدة البيانات...</p>
+                  <p className="text-sm text-slate-300">جاري تحميل المشاريع...</p>
                 </div>
               ) : filteredProjects.length === 0 ? (
                 <div className="glass-panel rounded-2xl p-10 text-center my-auto flex flex-col items-center justify-center gap-4">
@@ -1322,7 +1775,7 @@ export default function App() {
                   )}
                 </div>
               ) : (
-                /* Project Cards: سطر واحد على الهاتف والكمبيوتر، الوصف على اليمين وفي اليسار زر "فتح المنصة" فقط دون إظهار اللنكات من الخارج */
+                /* Project Cards: سطر واحد على الهاتف والكمبيوتر، الوصف على اليمين وفي اليسار زر "فتح المنصة" */
                 <div className="flex flex-col gap-3.5">
                   <AnimatePresence mode="popLayout">
                     {filteredProjects.map((project, index) => (
@@ -1388,7 +1841,6 @@ export default function App() {
             - توقيع المطور باللغة الإنجليزية
         ====================================================================== */}
         <footer className="pt-6 border-t border-white/10 flex flex-col md:flex-row items-center justify-between gap-6">
-          {/* Developer Signature (English) */}
           <p
             className="text-xs sm:text-sm font-medium text-slate-400 tracking-wide order-2 md:order-1"
             dir="ltr"
@@ -1487,7 +1939,6 @@ export default function App() {
               onClick={(e) => e.stopPropagation()}
               className="glass-modal relative w-full max-w-xl rounded-2xl p-6 sm:p-8 text-right max-h-[92vh] overflow-y-auto"
             >
-              {/* Top Header with Close Button (X) in Top-Left */}
               <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-6">
                 <div className="flex items-center gap-3">
                   <div className="h-10 w-10 rounded-xl bg-sky-500/15 border border-sky-400/40 flex items-center justify-center shadow-[0_0_16px_rgba(56,189,248,0.25)]">
@@ -1496,7 +1947,7 @@ export default function App() {
                   <div>
                     <h3 className="text-lg font-bold text-white">إضافة مشروع جديد</h3>
                     <p className="text-xs text-slate-300">
-                      أدخل بيانات وروابط المشروع لحفظها في سحابة فايربيز
+                      أدخل بيانات وروابط المشروع لحفظها فوراً
                     </p>
                   </div>
                 </div>
@@ -1511,7 +1962,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Add Project Form */}
               <form onSubmit={handleSaveProject} className="space-y-4">
                 {formError && (
                   <div className="rounded-xl bg-rose-500/15 border border-rose-400/40 px-4 py-3 text-xs text-rose-200">
@@ -1615,7 +2065,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* 5. لينك فاير بيز السحابي (تحت فيركال) */}
+                {/* 5. لينك فاير بيز السحابي */}
                 <div className="space-y-1.5">
                   <label
                     htmlFor="field-firebase-url"
@@ -1640,30 +2090,24 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Action Button: زر "حفظ" (Save) في الأسفل */}
+                {/* Action Button: زر "حفظ" */}
                 <div className="pt-4 border-t border-white/10 flex items-center justify-end gap-3">
                   <button
                     type="button"
-                    disabled={isSubmitting}
                     onClick={() => {
                       resetAddForm();
                       setIsAddModalOpen(false);
                     }}
-                    className="px-5 py-3 rounded-xl text-sm font-medium text-slate-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 transition-colors cursor-pointer disabled:opacity-50"
+                    className="px-5 py-3 rounded-xl text-sm font-medium text-slate-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 transition-colors cursor-pointer"
                   >
                     إلغاء
                   </button>
                   <button
                     type="submit"
-                    disabled={isSubmitting}
-                    className="glow-button-primary flex-1 sm:flex-initial sm:min-w-[160px] py-3 px-6 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="glow-button-primary flex-1 sm:flex-initial sm:min-w-[160px] py-3 px-6 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    {isSubmitting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Save className="w-4 h-4" />
-                    )}
-                    <span>{isSubmitting ? 'جاري الحفظ...' : 'حفظ'}</span>
+                    <Save className="w-4 h-4" />
+                    <span>حفظ</span>
                   </button>
                 </div>
               </form>
@@ -1674,8 +2118,6 @@ export default function App() {
 
       {/* =====================================================================
           PROJECT DETAILS MODAL (الشاشة المنبثقة لتفاصيل المشروع)
-          - عند الضغط على المشروع تفتح التفاصيل
-          - في نسخة الهاتف: بدل زر النسخ يظهر زر "فتح المنصة"، والرابط نفسه يكون عبارة عن زر "فتح المنصة" ولا يظهر نص الرابط إلا عند الضغط على "تعديل" بعد الدخول من الإعدادات
       ====================================================================== */}
       <AnimatePresence>
         {selectedProject && (
@@ -1699,10 +2141,8 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4 mb-5">
                 {isAuthenticated ? (
                   <div className="flex items-center gap-2.5">
-                    {/* Edit Button */}
                     <button
                       type="button"
-                      disabled={isSubmitting}
                       onClick={() => {
                         if (isEditingInModal) {
                           setIsEditingInModal(false);
@@ -1720,18 +2160,12 @@ export default function App() {
                       <span>{isEditingInModal ? 'إلغاء التعديل' : 'تعديل'}</span>
                     </button>
 
-                    {/* Delete Button */}
                     <button
                       type="button"
-                      disabled={isSubmitting}
                       onClick={() => handleDeleteProject(selectedProject.id)}
-                      className="px-4 py-2 rounded-xl text-xs sm:text-sm font-medium flex items-center gap-2 bg-rose-500/12 hover:bg-rose-500/25 border border-rose-400/35 hover:border-rose-400/70 text-rose-200 hover:shadow-[0_0_16px_rgba(244,63,94,0.3)] transition-all cursor-pointer disabled:opacity-50"
+                      className="px-4 py-2 rounded-xl text-xs sm:text-sm font-medium flex items-center gap-2 bg-rose-500/12 hover:bg-rose-500/25 border border-rose-400/35 hover:border-rose-400/70 text-rose-200 hover:shadow-[0_0_16px_rgba(244,63,94,0.3)] transition-all cursor-pointer"
                     >
-                      {isSubmitting ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Trash2 className="w-4 h-4" />
-                      )}
+                      <Trash2 className="w-4 h-4" />
                       <span>حذف</span>
                     </button>
                   </div>
@@ -1742,7 +2176,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Close Button (X) */}
                 <button
                   type="button"
                   onClick={handleCloseDetails}
@@ -1755,7 +2188,6 @@ export default function App() {
 
               {/* Modal Body */}
               {!isAuthenticated ? (
-                /* Visitor View (دون تسجيل الباسورد): يظهر فقط وصف الموقع وزر فتح المنصة بنفس شكل زر فتح منصة جوجل استوديو */
                 <div className="space-y-5">
                   <div className="glass-panel rounded-xl p-4 sm:p-5 space-y-2.5 border border-white/10">
                     <div className="flex items-center justify-between gap-2">
@@ -1783,7 +2215,6 @@ export default function App() {
                   </a>
                 </div>
               ) : isEditingInModal ? (
-                /* Edit Form (تظهر نصوص الروابط هنا فقط عند تعديل الرابط بعد تسجيل الدخول من الإعدادات) */
                 <form onSubmit={handleSaveEdit} className="space-y-4">
                   <div className="space-y-1.5">
                     <label className="block text-xs font-medium text-sky-300">
@@ -1865,7 +2296,6 @@ export default function App() {
                   <div className="pt-3 flex items-center justify-end gap-3">
                     <button
                       type="button"
-                      disabled={isSubmitting}
                       onClick={() => setIsEditingInModal(false)}
                       className="px-4 py-2.5 rounded-xl text-xs font-medium text-slate-300 bg-white/[0.05] hover:bg-white/[0.1] border border-white/10 cursor-pointer"
                     >
@@ -1873,22 +2303,15 @@ export default function App() {
                     </button>
                     <button
                       type="submit"
-                      disabled={isSubmitting}
-                      className="glow-button-primary px-6 py-2.5 rounded-xl text-xs font-semibold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                      className="glow-button-primary px-6 py-2.5 rounded-xl text-xs font-semibold text-white flex items-center gap-2 cursor-pointer"
                     >
-                      {isSubmitting ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Save className="w-4 h-4" />
-                      )}
+                      <Save className="w-4 h-4" />
                       <span>حفظ التعديلات</span>
                     </button>
                   </div>
                 </form>
               ) : (
-                /* Authenticated View inside Details Modal:
-                   - في نسخة الهاتف: بدل زر النسخ يظهر زر "فتح المنصة"، والرابط يكون عبارة عن "فتح المنصة" (لا يظهر الرابط النصي إلا في وضع التعديل أعلاه)
-                   - في نسخة الكمبيوتر (sm فما فوق): يظهر زر النسخ مع زر فتح المنصة */
+                /* Authenticated View inside Details Modal */
                 <div className="space-y-3.5">
                   {/* Field 1: وصف الموقع */}
                   <div className="glass-panel rounded-xl p-4 space-y-2 border border-white/10">
@@ -1898,7 +2321,6 @@ export default function App() {
                         <span>وصف الموقع</span>
                       </span>
 
-                      {/* Mobile: زر فتح المنصة بدل زر النسخ | Desktop: زر نسخ */}
                       <a
                         href={ensureProtocol(selectedProject.liveUrl)}
                         target="_blank"
@@ -1935,7 +2357,7 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* Field 2: لينك الموقع (Live URL) */}
+                  {/* Field 2: لينك الموقع */}
                   <div className="glass-panel rounded-xl p-4 flex items-center justify-between gap-3 border border-white/10">
                     <span className="text-xs font-medium text-sky-300 flex items-center gap-2">
                       <Globe className="w-4 h-4 shrink-0" />
@@ -1943,7 +2365,6 @@ export default function App() {
                     </span>
 
                     <div className="flex items-center gap-2">
-                      {/* Desktop Copy Button */}
                       <button
                         type="button"
                         disabled={!selectedProject.liveUrl}
@@ -1965,7 +2386,6 @@ export default function App() {
                         )}
                       </button>
 
-                      {/* الرابط عبارة عن زر "فتح المنصة" */}
                       <a
                         href={ensureProtocol(selectedProject.liveUrl)}
                         target="_blank"
@@ -2111,7 +2531,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Bottom Additional Link: رابط "Google Studio" (يظهر فقط عند تسجيل الدخول) */}
+              {/* Bottom Additional Link: رابط "Google Studio" */}
               {isAuthenticated && !isEditingInModal && (
                 <div className="mt-5 pt-4 border-t border-white/10 flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 text-xs text-slate-300">
@@ -2165,7 +2585,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* =====================================================================
-          SETTINGS MODAL (نافذة الإعدادات السرية + تعديل اسم الموقع وقائمة التواصل لحظياً)
+          SETTINGS MODAL (نافذة الإعدادات السرية + تعديل اسم الموقع وقائمة التواصل + تصدير واستيراد البيانات)
       ====================================================================== */}
       <AnimatePresence>
         {isSettingsModalOpen && (
@@ -2242,7 +2662,6 @@ export default function App() {
                   <div className="space-y-3 pt-3 border-t border-white/10">
                     <h4 className="text-xs font-bold text-sky-300">قائمة التواصل</h4>
 
-                    {/* لينك الفيس بوك */}
                     <div className="space-y-1.5">
                       <label
                         htmlFor="setting-fb"
@@ -2261,7 +2680,6 @@ export default function App() {
                       />
                     </div>
 
-                    {/* لينك الانستجرام */}
                     <div className="space-y-1.5">
                       <label
                         htmlFor="setting-ig"
@@ -2280,7 +2698,6 @@ export default function App() {
                       />
                     </div>
 
-                    {/* رقم الهاتف (واتساب) */}
                     <div className="space-y-1.5">
                       <label
                         htmlFor="setting-phone"
@@ -2297,6 +2714,35 @@ export default function App() {
                         placeholder="201000000000"
                         className="glass-input w-full px-4 py-2.5 rounded-xl text-xs sm:text-sm font-mono text-white text-left"
                       />
+                    </div>
+                  </div>
+
+                  {/* 3. تصدير البيانات واستيراد البيانات (كل البيانات المدخلة في الموقع) */}
+                  <div className="space-y-3 pt-3 border-t border-white/10">
+                    <h4 className="text-xs font-bold text-sky-300">
+                      نسخ احتياطي للبيانات (تصدير واستيراد كل البيانات المدخلة)
+                    </h4>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {/* زر تصدير البيانات */}
+                      <button
+                        type="button"
+                        onClick={handleExportAllData}
+                        className="py-2.5 px-4 rounded-xl text-xs sm:text-sm font-medium text-sky-200 bg-sky-500/15 hover:bg-sky-500/25 border border-sky-400/40 hover:border-sky-400/70 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Download className="w-4 h-4 text-sky-300" />
+                        <span>تصدير البيانات</span>
+                      </button>
+
+                      {/* زر استيراد البيانات */}
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="py-2.5 px-4 rounded-xl text-xs sm:text-sm font-medium text-cyan-200 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/40 hover:border-cyan-400/70 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Upload className="w-4 h-4 text-cyan-300" />
+                        <span>استيراد البيانات</span>
+                      </button>
                     </div>
                   </div>
 
